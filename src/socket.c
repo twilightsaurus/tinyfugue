@@ -1573,6 +1573,7 @@ static void setupnextconn(Sock *sock)
     if (sock->fd >= 0) {
 	clear_fd_sets(sock->fd);
 	close(sock->fd);
+	sock->fd = -1;
     }
 retry:
     next = next->ai_next;
@@ -1637,6 +1638,7 @@ static int openconn(Sock *sock)
 	    read(xsock->fd, (char*)xsock->addrs, info.size);
 	}
         close(xsock->fd);
+        xsock->fd = -1;
 # ifdef PLATFORM_UNIX
         if (xsock->pid >= 0)
             if (waitpid(xsock->pid, NULL, 0) < 0)
