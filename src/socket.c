@@ -27,6 +27,7 @@
 #include <sys/socket.h>
 #include <signal.h>	/* for killing resolver child process */
 
+#include <limits.h>
 #if WIDECHAR
 #include <unicode/ucnv.h>
 #include <unicode/ustring.h>
@@ -385,7 +386,7 @@ static int   handle_socket_input(const char *simbuffer, int simlen, const char* 
 static void  handle_socket_input_queue_lines(Sock *sock);
 static int   transmit(const char *s, unsigned int len);
 static void  telnet_send(String *cmd);
-static void  telnet_subnegotiation(void);
+static void  telnet_subnegotiation(String *subbuffer);
 static void  f_telnet_recv(int cmd, int opt);
 static int   is_quiet(Sock *sock, const char *str);
 static int   is_bamf(Sock *sock, unsigned long generation, const char *str);
@@ -394,9 +395,10 @@ static void  telnet_debug(const char *dir, const char *str, int len);
 static void  preferred_telnet_options(void);
 static void  killsock(Sock *sock);
 static void  clear_fd_sets(int fd);
+static int   socket_incarnation_live(Sock *sock, unsigned long generation);
 static int   socket_input_current(Sock *sock, unsigned long generation);
 static int   socket_input_live(Sock *sock, unsigned long generation);
-static int   socket_establishment_current(Sock *sock,
+static int   resume_socket_establishment(Sock *sock,
 		    unsigned long generation);
 #if HAVE_SSL
 static int   ssl_check_cert_verify(Sock *sock);
@@ -1333,6 +1335,8 @@ int world_hook(const char *fmt, const char *name)
 static int fg_sock(Sock *sock, int quiet)
 {
     static int depth = 0;
+    unsigned long generation = sock ? sock->generation : 0;
+    int result = 1;
 
     if (depth) {
         eprintf("illegal reentry");
@@ -1364,6 +1368,11 @@ static int fg_sock(Sock *sock, int quiet)
     hide_screen(NULL);
 
     if (sock) {
+	if (!socket_incarnation_current(sock, generation)) {
+	    result = 0;
+	    goto done;
+	}
+	xsock = sock;
 	if (sock->alert_id == alert_id) {
 	    clear_alert();
 	    sock->alert_id = 0;
@@ -1374,25 +1383,44 @@ static int fg_sock(Sock *sock, int quiet)
 	    sock->world->screen->active = 0;
             --active_count;
             update_status_field(NULL, STAT_ACTIVE);
+	    if (!socket_incarnation_current(sock, generation)) {
+		result = 0;
+		goto done;
+	    }
+	    xsock = sock;
         }
         fg_screen = sock->world->screen;
 	unhide_screen(fg_screen); /* must do before hook which might oflush */
         world_hook((sock->constate >= SS_ZOMBIE) ?
             "---- World %s (dead) ----" : "---- World %s ----",
            sock->world->name);
+	if (!socket_incarnation_current(sock, generation)) {
+	    result = 0;
+	    goto done;
+	}
+	xsock = sock;
 	switch_screen(quiet || !bg_output);
         tog_lp(NULL);
         update_prompt(sock->prompt, 1);
-        if (sockmload) wload(sock->world);
+        if (sockmload) {
+	    wload(sock->world);
+	    if (!socket_incarnation_current(sock, generation)) {
+		result = 0;
+		goto done;
+	    }
+	    xsock = sock;
+	}
     } else {
         fg_screen = default_screen;
 	unhide_screen(fg_screen);
         world_hook("---- No world ----", NULL);
+	xsock = NULL;
 	switch_screen(quiet || !bg_output);
         update_prompt(NULL, 1);
     }
+done:
     depth--;
-    return 1;
+    return result;
 }
 
 struct Value *handle_fg_command(String *args, int offset)
@@ -1571,7 +1599,12 @@ static int opensock(World *world, int flags)
 	Sock *sock = xsock;
 
 	fg_sock(sock, FALSE); /* XXX 2nd arg??? */
-	if (!socket_input_live(sock, generation)) return 0;
+	if (!socket_incarnation_live(sock, generation) ||
+	    sock->constate != SS_NEW)
+	{
+	    return 0;
+	}
+	xsock = sock;
     }
 
     if (flags & CONN_AUTOLOGIN) xsock->flags |= SOCKLOGIN;
@@ -1739,7 +1772,10 @@ retry:
     next = next->ai_next;
     /* if next address is a duplicate of one we've already done, skip it */
     for (ai = sock->addrs; next && ai != next; ai = ai->ai_next) {
-	if (memcmp(ai->ai_addr, next->ai_addr, ai->ai_addrlen) == 0) {
+	if (ai->ai_family == next->ai_family &&
+	    ai->ai_addrlen == next->ai_addrlen &&
+	    memcmp(ai->ai_addr, next->ai_addr, next->ai_addrlen) == 0)
+	{
 	    goto retry;
 	}
     }
@@ -2433,7 +2469,7 @@ ssl_connect_done:
 	if (!report_ssl_verify_messages(sock, generation))
 	    return 0;
 	ssl_check_cert_verify(sock);
-	if (!socket_establishment_current(sock, generation)) return 0;
+	if (!resume_socket_establishment(sock, generation)) return 0;
     }
 #endif
 
@@ -2441,11 +2477,11 @@ ssl_connect_done:
 
     if (xsock == fsock)   /* possible for a recycled zombie */
         update_status_field(NULL, STAT_WORLD);
-    if (!socket_establishment_current(sock, generation)) return 0;
+    if (!resume_socket_establishment(sock, generation)) return 0;
 
     if (xsock->flags & SOCKTELNET) {
         preferred_telnet_options();
-	if (!socket_establishment_current(sock, generation)) return 0;
+	if (!resume_socket_establishment(sock, generation)) return 0;
     }
 
     if (sock->flags & SOCKPROXY) {
@@ -2454,11 +2490,11 @@ ssl_connect_done:
         sock->host = STRDUP(sock->world->host);
         sock->port = STRDUP(sock->world->port);
         do_hook(H_PROXY, "", "%s", sock->world->name);
-	if (!socket_establishment_current(sock, generation)) return 0;
+	if (!resume_socket_establishment(sock, generation)) return 0;
     }
 
     wload(sock->world);
-    if (!socket_establishment_current(sock, generation)) return 0;
+    if (!resume_socket_establishment(sock, generation)) return 0;
 
     if (!(sock->flags & SOCKPROXY)) {
 #if HAVE_SSL
@@ -2468,19 +2504,19 @@ ssl_connect_done:
 	else
 #endif
 	    do_hook(H_CONNECT, "%% Connected to %s.", "%s", sock->world->name);
-	if (!socket_establishment_current(sock, generation)) return 0;
+	if (!resume_socket_establishment(sock, generation)) return 0;
 
         if (login && sock->flags & SOCKLOGIN) {
             if (world_character(sock->world) && world_pass(sock->world)) {
                 do_hook(H_LOGIN, NULL, "%s %s %s", sock->world->name,
                     world_character(sock->world), world_pass(sock->world));
-		if (!socket_establishment_current(sock, generation)) return 0;
+		if (!resume_socket_establishment(sock, generation)) return 0;
 	    }
             sock->flags &= ~SOCKLOGIN;
         }
     }
 
-    return socket_establishment_current(sock, generation);
+    return resume_socket_establishment(sock, generation);
 }
 
 #if HAVE_SSL
@@ -2932,6 +2968,26 @@ listsocket_error:
     return newint(socks.size);
 }
 
+int send_line_with_hook(conString *string, int eol_flag, int *hooked)
+{
+    Sock *sock = xsock;
+    unsigned long generation = sock ? sock->generation : 0;
+    int result = 0;
+
+    ((String *)string)->links++;
+    *hooked = do_hook(H_SEND, NULL, "%S", string);
+    if (!*hooked) {
+	if (!socket_incarnation_current(sock, generation)) {
+	    eprintf("Not connected.");
+	} else {
+	    xsock = sock;
+	    result = send_line(string->data, string->len, eol_flag);
+	}
+    }
+    conStringfree(string);
+    return result;
+}
+
 int handle_send_function(conString *string, const char *world,
     const char *flags)
 {
@@ -2957,8 +3013,13 @@ int handle_send_function(conString *string, const char *world,
     }
 
     xsock = (!world || !*world) ? xsock : find_sock(world);
-    if (!hook_flag || !do_hook(H_SEND, NULL, "%S", string))
+    if (hook_flag) {
+	int hooked;
+
+	result = send_line_with_hook(string, eol_flag, &hooked);
+    } else {
 	result = send_line(string->data, string->len, eol_flag);
+    }
     xsock = old_xsock;
     return result;
 }
@@ -3052,13 +3113,17 @@ int handle_fake_recv_function(conString *string, const char *world,
         eprintf("no open world %s", world ? world : "");
 	return 0;
     }
-    if (raw)
     {
-	handle_socket_input(string->data, string->len, NULL);
-    }
-    else {
-	queue_socket_line(sock, string, string->len, 0);
-	flushxsock();
+	Sock *old_xsock = xsock;
+
+	xsock = sock;
+	if (raw)
+	    handle_socket_input(string->data, string->len, NULL);
+	else {
+	    queue_socket_line(sock, string, string->len, 0);
+	    flushxsock();
+	}
+	xsock = old_xsock;
     }
     return 1;
 }
@@ -3069,6 +3134,7 @@ static int transmit(const char *str, unsigned int numtowrite)
 {
     Sock *sock;
     unsigned long generation;
+    unsigned int chunk;
     int numwritten, err;
 
     if (!xsock || xsock->constate != SS_CONNECTED)
@@ -3076,6 +3142,7 @@ static int transmit(const char *str, unsigned int numtowrite)
     sock = xsock;
     generation = sock->generation;
     while (numtowrite) {
+	chunk = numtowrite > INT_MAX ? INT_MAX : numtowrite;
 #if HAVE_SSL
 	if (sock->ssl) {
 	    SSL *ssl = sock->ssl;
@@ -3083,7 +3150,7 @@ static int transmit(const char *str, unsigned int numtowrite)
 	    unsigned long retired_generation;
 
 	    ERR_clear_error();
-	    numwritten = SSL_write(ssl, str, numtowrite);
+	    numwritten = SSL_write(ssl, str, chunk);
 	    err = errno;
 	    if (!socket_input_live(sock, generation) || sock->ssl != ssl)
 		return 0;
@@ -3111,7 +3178,7 @@ static int transmit(const char *str, unsigned int numtowrite)
 	} else
 #endif /* HAVE_SSL */
 	{
-	    numwritten = send(sock->fd, str, numtowrite, 0);
+	    numwritten = send(sock->fd, str, chunk, 0);
 	    if (numwritten < 0) {
 		err = errno;
 		/* Socket is blocking; EAGAIN and EWOULDBLOCK are impossible. */
@@ -3129,6 +3196,8 @@ static int transmit(const char *str, unsigned int numtowrite)
 		    return 0;
 		}
 	    }
+	    if (numwritten == 0)
+		return 0;
 	}
         numtowrite -= numwritten;
         str += numwritten;
@@ -3148,10 +3217,12 @@ static int transmit(const char *str, unsigned int numtowrite)
 int send_line(const char *src, unsigned int len, int eol_flag)
 {
     typedef struct {
-	int bufferlen;
+	size_t buffer1len;
+	size_t buffer2len;
 	char *buffer1;
 	char *buffer2;
 #if WIDECHAR
+	size_t utf16len;
 	UChar *utf16buf;
 #endif
     } send_buffer_t;
@@ -3161,16 +3232,16 @@ int send_line(const char *src, unsigned int len, int eol_flag)
     Sock *sock;
     unsigned long generation;
     unsigned int old_buffer_count, slot_index;
+    unsigned int i = 0, j = 0;
+    size_t needed, escaped_needed;
     char *buffer1, *buffer2;
-    int needed, result = 0;
-    int i = 0, j = 0;
+    int result = 0;
 
 #if WIDECHAR
     UChar *utf16buf;
-    const UChar *utf16_source;
-    char *target;
+    int32_t utf16_length, encoded_length;
+    UConverter *utf8_conv;
     UErrorCode err;
-    UBool ubool_true = TRUE;
 #endif
 
     if (!xsock || xsock->constate >= SS_ZOMBIE ||
@@ -3179,38 +3250,43 @@ int send_line(const char *src, unsigned int len, int eol_flag)
         eprintf("Not connected.");
         return 0;
     }
+    if (len > INT_MAX - 3 || send_depth == (unsigned int)-1) {
+	eprintf("Line too long.  Line not sent.");
+	return 0;
+    }
     sock = xsock;
     generation = sock->generation;
 
     slot_index = send_depth++;
     if (send_buffer_count <= slot_index) {
 	old_buffer_count = send_buffer_count;
+	if ((size_t)slot_index + 1 >
+	    (size_t)-1 / sizeof(*send_buffers))
+	{
+	    eprintf("Send recursion too deep.  Line not sent.");
+	    goto done;
+	}
 	send_buffer_count = slot_index + 1;
 	send_buffers = XREALLOC(send_buffers,
-	    send_buffer_count * sizeof(*send_buffers));
+	    (size_t)send_buffer_count * sizeof(*send_buffers));
 	memset(send_buffers + old_buffer_count, 0,
 	    (send_buffer_count - old_buffer_count) * sizeof(*send_buffers));
     }
 
-    needed = (len + 3) * 8;
-    if (send_buffers[slot_index].bufferlen < needed) {
-        send_buffers[slot_index].bufferlen = needed;
+    needed = (size_t)len + 3;
+    escaped_needed = needed * 2;
+    if (send_buffers[slot_index].buffer1len < needed) {
         send_buffers[slot_index].buffer1 =
 	    XREALLOC(send_buffers[slot_index].buffer1, needed);
+	send_buffers[slot_index].buffer1len = needed;
+    }
+    if (send_buffers[slot_index].buffer2len < escaped_needed) {
         send_buffers[slot_index].buffer2 =
-	    XREALLOC(send_buffers[slot_index].buffer2, needed);
-#if WIDECHAR
-        /* bufferlen / 2 is a UChar count, but XREALLOC takes bytes. */
-        send_buffers[slot_index].utf16buf = XREALLOC(
-	    send_buffers[slot_index].utf16buf,
-	    needed / 2 * sizeof(*send_buffers[slot_index].utf16buf));
-#endif
+	    XREALLOC(send_buffers[slot_index].buffer2, escaped_needed);
+	send_buffers[slot_index].buffer2len = escaped_needed;
     }
     buffer1 = send_buffers[slot_index].buffer1;
     buffer2 = send_buffers[slot_index].buffer2;
-#if WIDECHAR
-    utf16buf = send_buffers[slot_index].utf16buf;
-#endif
     memcpy(buffer1, src, len);
     buffer1[len] = '\0';
 
@@ -3256,37 +3332,87 @@ int send_line(const char *src, unsigned int len, int eol_flag)
     }
 
 #if WIDECHAR
-    /* Buf1 -> Buf2  [UTF8  -> UTF16] */
-    /* Buf2 -> Buf1  [UTF16 -> XCHAR] */
+    /* Convert UTF-8 to UTF-16, then UTF-16 to the socket charset.  Preflight
+     * both conversions because invalid UTF-8 escape callbacks can expand the
+     * input by more than any fixed multiplier. */
     err = U_ZERO_ERROR;
-    target = buffer1;
-    utf16_source = utf16buf;
-    /* First attempt at fixing. Probably better to make this one stick
-     * around longer but enh. */
-    {
-	UConverter *utf8_conv = ucnv_open("UTF8", &err);
-	ucnv_setToUCallBack(utf8_conv, UCNV_TO_U_CALLBACK_ESCAPE,
-	    UCNV_ESCAPE_XML_HEX, NULL, NULL, &err);
-	j = ucnv_toUChars(utf8_conv, utf16buf,
-	    send_buffers[slot_index].bufferlen / 2, buffer1, len, &err);
-	ucnv_close(utf8_conv);
+    utf8_conv = ucnv_open("UTF8", &err);
+    if (U_FAILURE(err) || !utf8_conv) {
+	if (utf8_conv) ucnv_close(utf8_conv);
+	eprintf("Unable to initialize UTF-8 conversion.  Line not sent.");
+	goto done;
     }
-    /* dest, dest_len, written_units, src, src_len, errors */
-    /* u_strFromUTF8(utf16buf, bufferlen / 2, &j, buffer1, len, &err); */
-    /* 'incomingfsm' has an outgoing state machine, as well. Used here. */
-    ucnv_resetFromUnicode(sock->incomingfsm);
-    ucnv_fromUnicode(sock->incomingfsm,  /* Converter */
-            &target, buffer1 + send_buffers[slot_index].bufferlen,
-	    /* target, limit_ptr */
-            &utf16_source, utf16buf + j,  /* source, limit_ptr */
-            NULL, ubool_true, &err);      /* offsets, flush, errors */
-    len = target - buffer1; /* 'target' is moved to end during conversion */
+    ucnv_setToUCallBack(utf8_conv, UCNV_TO_U_CALLBACK_ESCAPE,
+	UCNV_ESCAPE_XML_HEX, NULL, NULL, &err);
+    if (U_FAILURE(err)) {
+	ucnv_close(utf8_conv);
+	eprintf("Unable to initialize UTF-8 conversion.  Line not sent.");
+	goto done;
+    }
+    err = U_ZERO_ERROR;
+    utf16_length = ucnv_toUChars(utf8_conv, NULL, 0, buffer1, len, &err);
+    if (utf16_length < 0 ||
+	(U_FAILURE(err) && err != U_BUFFER_OVERFLOW_ERROR)) {
+	ucnv_close(utf8_conv);
+	eprintf("Broken characters found.  Line not sent.");
+	goto done;
+    }
+    needed = utf16_length ? (size_t)utf16_length : 1;
+    if (needed > (size_t)-1 / sizeof(*utf16buf)) {
+	ucnv_close(utf8_conv);
+	eprintf("Converted line too long.  Line not sent.");
+	goto done;
+    }
+    if (send_buffers[slot_index].utf16len < needed) {
+	send_buffers[slot_index].utf16buf = XREALLOC(
+	    send_buffers[slot_index].utf16buf, needed * sizeof(*utf16buf));
+	send_buffers[slot_index].utf16len = needed;
+    }
+    utf16buf = send_buffers[slot_index].utf16buf;
+    err = U_ZERO_ERROR;
+    utf16_length = ucnv_toUChars(utf8_conv, utf16buf,
+	send_buffers[slot_index].utf16len, buffer1, len, &err);
+    ucnv_close(utf8_conv);
+    if (U_FAILURE(err)) {
+	eprintf("Broken characters found.  Line not sent.");
+	goto done;
+    }
 
-    if (U_FAILURE(err))
+    ucnv_resetFromUnicode(sock->incomingfsm);
+    err = U_ZERO_ERROR;
+    encoded_length = ucnv_fromUChars(sock->incomingfsm, NULL, 0,
+	utf16buf, utf16_length, &err);
+    if (U_FAILURE(err) && err != U_BUFFER_OVERFLOW_ERROR) {
+	eprintf("Broken characters found.  Line not sent.");
+	goto done;
+    }
+    if (encoded_length < 0 || encoded_length >= INT_MAX ||
+	(unsigned int)encoded_length > (UINT_MAX - 1) / 2)
     {
-        eprintf("Broken characters found. Line not sent.");
-        goto done;
-        /* core("outbound_decode U_FAILURE", __FILE__, __LINE__, 0); */
+	eprintf("Converted line too long.  Line not sent.");
+	goto done;
+    }
+    needed = (size_t)encoded_length + 1;
+    escaped_needed = (size_t)encoded_length * 2 + 1;
+    if (send_buffers[slot_index].buffer1len < needed) {
+	send_buffers[slot_index].buffer1 =
+	    XREALLOC(send_buffers[slot_index].buffer1, needed);
+	send_buffers[slot_index].buffer1len = needed;
+    }
+    if (send_buffers[slot_index].buffer2len < escaped_needed) {
+	send_buffers[slot_index].buffer2 =
+	    XREALLOC(send_buffers[slot_index].buffer2, escaped_needed);
+	send_buffers[slot_index].buffer2len = escaped_needed;
+    }
+    buffer1 = send_buffers[slot_index].buffer1;
+    buffer2 = send_buffers[slot_index].buffer2;
+    ucnv_resetFromUnicode(sock->incomingfsm);
+    err = U_ZERO_ERROR;
+    len = ucnv_fromUChars(sock->incomingfsm, buffer1,
+	send_buffers[slot_index].buffer1len, utf16buf, utf16_length, &err);
+    if (U_FAILURE(err)) {
+	eprintf("Broken characters found.  Line not sent.");
+	goto done;
     }
 #endif
 
@@ -3300,7 +3426,23 @@ int send_line(const char *src, unsigned int len, int eol_flag)
     }
 
     if (sock->flags & SOCKECHO) {
-        handle_socket_input(buffer2, i, "UTF-8");
+	if (i > INT_MAX) {
+	    eprintf("Echoed line too long.  Line not sent.");
+	    goto done;
+	}
+#if WIDECHAR
+	const char *echo_encoding;
+
+	err = U_ZERO_ERROR;
+	echo_encoding = ucnv_getName(sock->incomingfsm, &err);
+	if (U_FAILURE(err) || !echo_encoding) {
+	    eprintf("Unable to identify socket charset.  Line not echoed.");
+	    goto done;
+	}
+        handle_socket_input(buffer2, i, echo_encoding);
+#else
+        handle_socket_input(buffer2, i, NULL);
+#endif
 	if (!socket_input_live(sock, generation)) goto done;
     }
     if (sock->constate == SS_CONNECTED)
@@ -3557,22 +3699,42 @@ static void schedule_prompt(Sock *sock)
     }
 }
 
+unsigned long socket_generation(const struct Sock *sock)
+{
+    return sock ? sock->generation : 0;
+}
+
+int socket_incarnation_current(struct Sock *sock, unsigned long generation)
+{
+    return sock && sock->generation == generation;
+}
+
+static int socket_incarnation_live(Sock *sock, unsigned long generation)
+{
+    return socket_incarnation_current(sock, generation) &&
+	sock->constate < SS_ZOMBIE;
+}
+
 static int socket_input_current(Sock *sock, unsigned long generation)
 {
-    return xsock == sock && sock->generation == generation;
+    return xsock == sock && socket_incarnation_current(sock, generation);
 }
 
 static int socket_input_live(Sock *sock, unsigned long generation)
 {
-    return socket_input_current(sock, generation) &&
-	sock->constate < SS_ZOMBIE;
+    return xsock == sock && socket_incarnation_live(sock, generation);
 }
 
-static int socket_establishment_current(Sock *sock,
+static int resume_socket_establishment(Sock *sock,
     unsigned long generation)
 {
-    return socket_input_live(sock, generation) &&
-	(sock->constate == SS_CONNECTED || sock->constate == SS_OPEN);
+    if (!socket_incarnation_live(sock, generation) ||
+	(sock->constate != SS_CONNECTED && sock->constate != SS_OPEN))
+    {
+	return 0;
+    }
+    xsock = sock;
+    return 1;
 }
 
 static void test_prompt(void)
@@ -3598,18 +3760,15 @@ static void test_prompt(void)
     }
 }
 
-static void telnet_subnegotiation(void)
+static void telnet_subnegotiation(String *subbuffer)
 {
     Sock *sock = xsock;
     unsigned long generation = sock->generation;
-    unsigned int i;
     char *p, *end;
-    char temp_buff[255]; /* Same length as whole subnegotiation line. */
-    char *temp_ptr;
     int ttype;
-    char charset_sep = '\0';
 #if WIDECHAR
-    UConverter* newconverter = NULL;
+    char temp_buff[255];
+    UConverter *newconverter = NULL;
     UErrorCode newconvertererr;
 #endif
 
@@ -3620,18 +3779,22 @@ static void telnet_subnegotiation(void)
         STRING_LITERAL("UNKNOWN"),
         STRING_NULL };
 
-    telnet_debug("recv", xsock->subbuffer->data, xsock->subbuffer->len);
+    telnet_debug("recv", subbuffer->data, subbuffer->len);
     if (!socket_input_live(sock, generation)) return;
-    Stringtrunc(xsock->subbuffer, xsock->subbuffer->len - 2);
-    p = xsock->subbuffer->data + 2;
-    end = p + xsock->subbuffer->len;
+    if (subbuffer->len < 5) {
+	no_reply("invalid syntax");
+	return;
+    }
+    Stringtrunc(subbuffer, subbuffer->len - 2);
+    p = subbuffer->data + 2;
+    end = subbuffer->data + subbuffer->len;
     switch (*p) {
     case TN_TTYPE:
 	if (!TELOPT(xsock, us, *p)) {
 	    no_reply("option was not agreed on");
 	    break;
 	}
-        if (*++p != '\01' || xsock->subbuffer->len != 4) {
+        if (p + 1 >= end || p[1] != '\01' || subbuffer->len != 4) {
 	    no_reply("invalid syntax");
 	    break;
 	}
@@ -3656,36 +3819,45 @@ static void telnet_subnegotiation(void)
             no_reply("option was not agreed upon");
             break;
         }
-        if (*++p == '\01') { /* REQUEST <sep> <character set>... */
-           charset_sep = *++p;
-           while (p != end) {
-              temp_ptr = ++p;
-              while (p != end && *p != charset_sep) {
-                  temp_buff[p - temp_ptr] = (*p & ~0x80);
-                  ++p;
-              }
-              temp_buff[p - temp_ptr] = '\0';
-              newconvertererr = U_ZERO_ERROR;
-              newconverter = ucnv_open(temp_buff, &newconvertererr);
-          /* TODO: Check U_MEMORY_ALLOCATION_ERROR and U_FILE_ACCESS_ERROR */
-              if (newconverter != NULL) {
-                  p = end; /* Prefer the first valid charset! */
-              }
-           }
-           if (newconverter != NULL) {
-              Sprintf(telbuf, "%c%c%c%c%s%c%c", TN_IAC, TN_SB, TN_CHARSET, '\02', temp_buff, TN_IAC, TN_SE);
-              /* TODO: Don't reset if we're already using this charset. */
-              /* XXX: This breaks if we were scanning simbuffer. Dangit. */
-              inbound_decode_str(xsock->buffer, xsock->incomingposttelnet, 
-                  xsock->incomingfsm, 1); /* 1; nothing else to convert */
-              handle_socket_input_queue_lines(xsock);
-              ucnv_close(xsock->incomingfsm);
-              xsock->incomingfsm = newconverter;
-           } else {
-              Sprintf(telbuf, "%c%c%c%c%c%c", TN_IAC, TN_SB, TN_CHARSET, '\03', TN_IAC, TN_SE);
-           }
+	p++;
+        if (p < end && *p++ == '\01' && p < end) {
+	    char charset_sep = *p++;
+
+	    while (p < end && !newconverter) {
+		size_t len = 0;
+		int overlong = 0;
+
+		while (p < end && *p != charset_sep) {
+		    if (len + 1 < sizeof(temp_buff))
+			temp_buff[len++] = ((unsigned char)*p & 0x7F);
+		    else
+			overlong = 1;
+		    p++;
+		}
+		if (p < end) p++;
+		if (overlong || !len) continue;
+		temp_buff[len] = '\0';
+		newconvertererr = U_ZERO_ERROR;
+		newconverter = ucnv_open(temp_buff, &newconvertererr);
+		if (U_FAILURE(newconvertererr) && newconverter) {
+		    ucnv_close(newconverter);
+		    newconverter = NULL;
+		}
+	    }
+	    if (newconverter) {
+		Sprintf(telbuf, "%c%c%c%c%s%c%c", TN_IAC, TN_SB,
+		    TN_CHARSET, '\02', temp_buff, TN_IAC, TN_SE);
+		inbound_decode_str(xsock->buffer, xsock->incomingposttelnet,
+		    xsock->incomingfsm, 1);
+		handle_socket_input_queue_lines(xsock);
+		ucnv_close(xsock->incomingfsm);
+		xsock->incomingfsm = newconverter;
+	    } else {
+		Sprintf(telbuf, "%c%c%c%c%c%c", TN_IAC, TN_SB,
+		    TN_CHARSET, '\03', TN_IAC, TN_SE);
+	    }
         } else {
-            no_reply("option not implemented");
+            no_reply("invalid syntax");
             break;
         }
         telnet_send(telbuf);
@@ -3693,12 +3865,12 @@ static void telnet_subnegotiation(void)
 #endif
 #if ENABLE_ATCP
     case TN_ATCP:
-	    do_hook(H_ATCP, NULL, "%s", xsock->subbuffer->data + 3);
+	    do_hook(H_ATCP, NULL, "%s", subbuffer->data + 3);
 	    break;
 #endif
 #if ENABLE_GMCP
     case TN_GMCP:
-	    do_hook(H_GMCP, NULL, "%s", xsock->subbuffer->data + 3);
+	    do_hook(H_GMCP, NULL, "%s", subbuffer->data + 3);
 	    break;
 #endif
 #if ENABLE_MSDP
@@ -3707,23 +3879,20 @@ static void telnet_subnegotiation(void)
 	    STATIC_BUFFER(msdp_out);
 	    /* payload starts right after IAC SB MSDP (data+3) and runs to
 	     * the end of the (already IAC-SE-trimmed) subbuffer */
-	    msdp_decode(xsock->subbuffer->data + 3,
-			xsock->subbuffer->len - 3, msdp_out);
+	    msdp_decode(subbuffer->data + 3, subbuffer->len - 3, msdp_out);
 	    do_hook(H_MSDP, NULL, "%s", msdp_out->data);
 	}
 	    break;
 #endif
 #if ENABLE_OPTION102
     case TN_102:
-	    do_hook(H_OPTION102, NULL, "%s", xsock->subbuffer->data + 3);
+	    do_hook(H_OPTION102, NULL, "%s", subbuffer->data + 3);
 	    break;
 #endif
     default:
 	no_reply("unknown option");
         break;
     }
-    if (!socket_input_live(sock, generation)) return;
-    Stringtrunc(xsock->subbuffer, 0);
 }
 
 static void f_telnet_recv(int cmd, int opt)
@@ -3869,7 +4038,6 @@ static int handle_socket_input(const char *simbuffer, int simlen, const char *en
 #if WIDECHAR
     if (encoding == NULL) {
 	incomingposttelnet = xsock->incomingposttelnet;
-	incomingFSM = xsock->incomingfsm;
     } else {
         /* Using simlen because we assume we'll have UTF-8 anyway */
 	incomingposttelnet = Stringnew(NULL, simlen, 0);
@@ -3964,7 +4132,7 @@ static int handle_socket_input(const char *simbuffer, int simlen, const char *en
 		    /* Socket is blocking; EAGAIN and EWOULDBLOCK impossible. */
 #if WIDECHAR
 		    inbound_decode_str(sock->buffer, incomingposttelnet,
-			incomingFSM, 1);
+			encoding ? incomingFSM : sock->incomingfsm, 1);
 #endif
 		    if (sock->buffer->len) { /* Destroy the buffers */
 			handle_socket_input_queue_lines(sock);
@@ -4017,9 +4185,6 @@ static int handle_socket_input(const char *simbuffer, int simlen, const char *en
 		    received += handle_socket_input(mccpbuffer, count, NULL);
 		    if (!socket_input_live(sock, generation))
 			goto cleanup_received;
-#if WIDECHAR
-		    if (!encoding) incomingFSM = sock->incomingfsm;
-#endif
 		    /* prepare to handle noncompressed stuff after stream end */
 		    incoming = (char*)trailing;
 		    count = trailing_len;
@@ -4071,7 +4236,7 @@ static int handle_socket_input(const char *simbuffer, int simlen, const char *en
 			goto cleanup_received;
 #if WIDECHAR
 		    inbound_decode_str(xsock->buffer, incomingposttelnet,
-                        incomingFSM, 0);
+                        encoding ? incomingFSM : sock->incomingfsm, 0);
 #endif
 		    handle_socket_input_queue_lines(xsock);
 		    queue_socket_line(xsock, CS(xsock->buffer), xsock->buffer->len, F_SERVPROMPT);
@@ -4156,7 +4321,7 @@ static int handle_socket_input(const char *simbuffer, int simlen, const char *en
                      */
 #if WIDECHAR
 		    inbound_decode_str(xsock->buffer, incomingposttelnet,
-                        incomingFSM, 0);
+                        encoding ? incomingFSM : sock->incomingfsm, 0);
 #endif
 		    handle_socket_input_queue_lines(xsock);
 		    flushxsock();
@@ -4170,13 +4335,14 @@ static int handle_socket_input(const char *simbuffer, int simlen, const char *en
 		} else if (xsock->substate == TN_IAC) {
                     if (rawchar == TN_SE) {
 			Sappendf(xsock->subbuffer, "%c%c", TN_IAC, TN_SE);
+			String subbuffer = *xsock->subbuffer;
+
+			Stringninit(xsock->subbuffer, 1);
                         xsock->fsastate = '\0';
-                        telnet_subnegotiation();
+                        telnet_subnegotiation(&subbuffer);
+			Stringfree(&subbuffer);
 			if (!socket_input_live(sock, generation))
 			    goto cleanup_received;
-#if WIDECHAR
-			if (!encoding) incomingFSM = sock->incomingfsm;
-#endif
                     } else {
                         Stringadd(xsock->subbuffer, rawchar);
                         xsock->substate = '\0';
@@ -4190,13 +4356,14 @@ static int handle_socket_input(const char *simbuffer, int simlen, const char *en
 		    if (xsock->subbuffer->len == 5 &&
 			memcmp(xsock->subbuffer->data, mccp1_subneg, 5) == 0)
 		    {
+			String subbuffer = *xsock->subbuffer;
+
+			Stringninit(xsock->subbuffer, 1);
 			xsock->fsastate = '\0';
-			telnet_subnegotiation();
+			telnet_subnegotiation(&subbuffer);
+			Stringfree(&subbuffer);
 			if (!socket_input_live(sock, generation))
 			    goto cleanup_received;
-#if WIDECHAR
-			if (!encoding) incomingFSM = sock->incomingfsm;
-#endif
 		    }
 #endif
                 }
@@ -4393,7 +4560,8 @@ non_telnet:
 	/* Take incomingposttelnet and convert to UTF-8, writing to
          * xsock->buffer. Shift incomingposttelnet by length converted.
          * Data CAN be left over. */
-        inbound_decode_str(xsock->buffer, incomingposttelnet, incomingFSM, 0);
+        inbound_decode_str(xsock->buffer, incomingposttelnet,
+	    encoding ? incomingFSM : sock->incomingfsm, 0);
 #endif
         /* Non-WIDECHAR just writes to xsock->buffer.
         Stringcpy(xsock->buffer, incomingposttelnet);

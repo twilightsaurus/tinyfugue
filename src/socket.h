@@ -23,6 +23,9 @@
 extern String *incoming_text;
 extern int quit_flag;
 extern struct Sock *xsock;
+extern unsigned long socket_generation(const struct Sock *sock);
+extern int     socket_incarnation_current(struct Sock *sock,
+		    unsigned long generation);
 
 extern void    main_loop(void);
 extern void    init_sock(void);
@@ -36,6 +39,8 @@ extern int     tog_keepalive(Var *var);
 extern int     openworld(const char *name, const char *port, int flags);
 extern void    world_output(struct World *world, conString *line);
 extern int     send_line(const char *s, unsigned int len, int eol_flag);
+extern int     send_line_with_hook(conString *string, int eol_flag,
+		    int *hooked);
 extern conString *fgprompt(void);
 extern int     tog_lp(Var *var);
 extern void    transmit_window_size(void);

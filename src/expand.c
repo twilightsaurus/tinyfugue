@@ -598,9 +598,12 @@ Value *prog_interpret(const Program *prog, int in_expr)
 		    tfprintf(tferr, "%S%s%S%A", do_mprefix(), "SEND: ", constr,
 			mecho_attr);
 #endif
-		if (!do_hook(H_SEND, NULL, "%S", constr)) {
-		    set_user_result(newint(send_line(constr->data, constr->len,
-			TRUE)));
+		{
+		    int hooked;
+		    int sent = send_line_with_hook(constr, TRUE, &hooked);
+
+		    if (!hooked)
+			set_user_result(newint(sent));
 		}
 	    }
 	    if (no_arg) Stringtrunc(buf, 0);

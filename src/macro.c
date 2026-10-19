@@ -1622,6 +1622,9 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
     Pattern *pattern;
     Macro *macro;
     const char *worldtype = NULL;
+    struct Sock *matchsock;
+    unsigned long match_generation;
+    int context_valid = 1;
 
     /* Macros are sorted by decreasing priority, with fall-thrus first.  So,
      * we search the global and world lists in parallel.  For each matching
@@ -1643,6 +1646,9 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
      * after itself in a list.
      */
 
+    matchsock = xsock;
+    match_generation = socket_generation(matchsock);
+
     if (world)
 	worldtype = world_type(world);
     if (!worldtype)
@@ -1663,7 +1669,7 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 	init_queue(runq);
     }
 
-    while (gnode || wnode) {
+    while ((gnode || wnode) && context_valid) {
 	nodep = (!wnode) ? &gnode : (!gnode) ? &wnode :
 	    (rpricmp(MAC(wnode), MAC(gnode)) > 0) ? &gnode : &wnode;
 	macro = MAC(*nodep);
@@ -1697,6 +1703,11 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 	    result = expr_value_safe(macro->exprprog);
             expr_condition = valbool(result);
             freeval(result);
+	    context_valid = !matchsock ||
+		socket_incarnation_current(matchsock, match_generation);
+	    if (!context_valid) break;
+	    if (matchsock)
+		xsock = matchsock;
             if (!expr_condition) continue;
         }
         pattern = hooknum>=0 ? &macro->hargs : &macro->trig;
@@ -1726,6 +1737,9 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 			    text = *linep;
 			    text->links++;
 			}
+			context_valid = !matchsock ||
+			    socket_incarnation_current(matchsock,
+				match_generation);
 		    }
 		} else {
 		    /* collect list of non-fall-thru matches */
@@ -1765,7 +1779,7 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 
     if (exec_list_long == 0) {
 	/* select exactly one of the non fall-thrus. */
-	if (num > 0) {
+	if (context_valid && num > 0) {
 	    for (macro = nonfallthru, num = RRAND(0, num-1); num; num--)
 		macro = macro->tnext;
 	    if (linep && *linep)
@@ -1774,11 +1788,13 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 		enqueue(runq, macro);
 	    } else {
 		ran += run_match(macro, text, hooknum);
+		context_valid = !matchsock ||
+		    socket_incarnation_current(matchsock, match_generation);
 	    }
 	}
 
 	/* print the line! */
-	if (hooknum>=0 && linep && *linep) {
+	if (context_valid && hooknum>=0 && linep && *linep) {
 	    if (hook_table[hooknum].hooktype & HT_ALERT) {
 		alert(CS(*linep));
 	    } else if (hook_table[hooknum].hooktype & HT_WORLD) {
@@ -1787,21 +1803,30 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 		 * clobber the alert */
 		if (xworld())
 		    world_output(xworld(), CS(*linep));
-		if (!xsock_is_fg()) {
+		context_valid = !matchsock ||
+		    socket_incarnation_current(matchsock, match_generation);
+		if (context_valid && !xsock_is_fg())
 		    alert(CS(*linep));
-		}
 	    } else {
 		tfputline(CS(*linep), tferr); /* XXX conStr bug??? */
 	    }
-	    if (hook_table[hooknum].hooktype & HT_XSOCK) {
+	    context_valid = !matchsock ||
+		socket_incarnation_current(matchsock, match_generation);
+	    if (context_valid &&
+		(hook_table[hooknum].hooktype & HT_XSOCK))
+	    {
 		xsock_alert_id(); /* alert should clear when xsock is fg'd */
 	    }
 	}
 
 	/* run all of the queued macros */
-	while ((macro = (Macro*)dequeue(runq))) {
+	while (context_valid && (macro = (Macro*)dequeue(runq))) {
 	    ran += run_match(macro, text, hooknum);
+	    context_valid = !matchsock ||
+		socket_incarnation_current(matchsock, match_generation);
 	}
+	while (dequeue(runq))
+	    /* discard callbacks belonging to a retired incarnation */;
     } else {
 	oprintf("%% %s would have %s %d macro%s.",
 	    hooknum>=0 ? "Event" : "Text", hooknum>=0 ? "hooked" : "triggered",
