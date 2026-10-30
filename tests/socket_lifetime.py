@@ -20,6 +20,12 @@ import zlib
 TIMEOUT = 15
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
+def recv_or_eof(conn):
+    try:
+        return conn.recv(4096)
+    except ConnectionResetError:
+        return b""
+
 # Self-signed loopback fixture; this private key has no use outside the tests.
 
 
@@ -164,7 +170,7 @@ class ScriptedServer(LoopbackServer):
                 if payload:
                     conn.sendall(payload)
                 while True:
-                    data = conn.recv(4096)
+                    data = recv_or_eof(conn)
                     if not data:
                         break
                     received.extend(data)
@@ -183,7 +189,7 @@ class ReleaseServer(LoopbackServer):
         received = bytearray()
         with conn:
             while True:
-                data = conn.recv(4096)
+                data = recv_or_eof(conn)
                 if not data:
                     break
                 received.extend(data)
@@ -229,7 +235,7 @@ class GatedAcceptServer(LoopbackServer):
                 if payload:
                     conn.sendall(payload)
                 while True:
-                    data = conn.recv(4096)
+                    data = recv_or_eof(conn)
                     if not data:
                         break
                     received.extend(data)
@@ -248,7 +254,7 @@ class RequestGatedServer(LoopbackServer):
     def _drain(self, server, conn, received):
         with conn:
             while True:
-                data = conn.recv(4096)
+                data = recv_or_eof(conn)
                 if not data:
                     break
                 received.extend(data)
