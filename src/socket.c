@@ -85,6 +85,7 @@ struct sockaddr_in {
 #include "command.h"
 #include "signals.h"
 #include "variable.h"	/* set_var_by_*() */
+#include "expand.h"
 
 #if ENABLE_MSDP
 #include "msdp.h"
@@ -352,7 +353,7 @@ typedef struct {
 } nbgai_hdr_t;
 
 static Sock *find_sock(const char *name);
-static void  wload(World *w);
+static int   wload(World *w, Sock *sock, unsigned long generation);
 static int   fg_sock(Sock *sock, int quiet);
 static int   get_host_address(Sock *sock, const char **what, int *errp);
 #if !HAVE_GETADDRINFO
@@ -395,7 +396,6 @@ static void  telnet_debug(const char *dir, const char *str, int len);
 static void  preferred_telnet_options(void);
 static void  killsock(Sock *sock);
 static void  clear_fd_sets(int fd);
-static int   socket_incarnation_live(Sock *sock, unsigned long generation);
 static int   socket_input_current(Sock *sock, unsigned long generation);
 static int   socket_input_live(Sock *sock, unsigned long generation);
 static int   resume_socket_establishment(Sock *sock,
@@ -937,9 +937,12 @@ void main_loop(void)
     static int depth = 0;
     struct timeval tv, *tvp;
     struct timeval refresh_tv;
+    ProgContext *saved_prog_context;
     STATIC_STRING(low_memory_msg,
 	"% WARNING: memory is low.  Try reducing history sizes.", 0);
 
+    /* Events dispatched here own contexts independent of a suspended caller. */
+    saved_prog_context = suspend_prog_context();
     depth++;
     while (!quit_flag) {
         if (depth > 1 && interrupted()) break;
@@ -1123,12 +1126,12 @@ void main_loop(void)
                             FD_CLR(xsock->fd, &readers);
                         }
                     }
-		    if (xsock->queue.list.head)
+		    if (xsock && xsock->queue.list.head)
 			handle_socket_lines();
 
 		    /* If there's a partial line that's past prompt_timeout,
 		     * make it a prompt. */
-		    if (xsock->constate < SS_ZOMBIE &&
+		    if (xsock && xsock->constate < SS_ZOMBIE &&
 			xsock->prompt_timeout.tv_sec)
 		    {
 			gettime(&now);
@@ -1195,6 +1198,7 @@ void main_loop(void)
     /* If exiting recursive main_loop, count, active, and connected in the
      * parent main_loop are invalid.  Set count to 0 to indicate that. */
     count = 0;
+    restore_prog_context(saved_prog_context);
 }
 
 int sockecho(void)
@@ -1317,12 +1321,14 @@ static Sock *find_sock(const char *name)
 }
 
 /* load macro file for a world */
-static void wload(World *w)
+static int wload(World *w, Sock *sock, unsigned long generation)
 {
     const char *mfile;
-    if (restriction >= RESTRICT_FILE) return;
-    if ((mfile = world_mfile(w)))
-        do_file_load(mfile, FALSE, NULL);
+    if (restriction >= RESTRICT_FILE) return 1;
+    if (!(mfile = world_mfile(w))) return 1;
+    do_file_load_for_socket(mfile, FALSE, NULL, sock, generation);
+    return revalidate_prog_context_socket(sock, generation) &&
+	!current_prog_context_cancelled();
 }
 
 int world_hook(const char *fmt, const char *name)
@@ -1331,30 +1337,54 @@ int world_hook(const char *fmt, const char *name)
 	name ? name : "");
 }
 
+static int foreground_context_current(Sock *sock, unsigned long generation)
+{
+    return revalidate_prog_context_socket(sock, generation) &&
+	!current_prog_context_cancelled();
+}
+
 /* bring a socket into the foreground */
 static int fg_sock(Sock *sock, int quiet)
 {
     static int depth = 0;
+    Sock *old_fsock;
+    unsigned long old_generation;
     unsigned long generation = sock ? sock->generation : 0;
-    int result = 1;
+    int restore_foreground = 0, result = 1;
+    int old_marked_active = 0, target_marked_inactive = 0;
+    ProgContext foreground_context, *saved_prog_context = NULL;
+    int foreground_context_pushed = 0;
 
     if (depth) {
         eprintf("illegal reentry");
         return 0;
     }
+    old_fsock = fsock;
+    old_generation = socket_generation(old_fsock);
 
     if (sockecho() != (!sock || !TELOPT(sock, them, TN_ECHO)))
         set_refresh_pending(REF_LOGICAL);
 
     xsock = sock;
     if (sock == fsock) return 2;  /* already there */
+    depth++;
 
     if (fsock) {                          /* the socket being backgrounded... */
 	/* ...has new text */
         if (fsock->world->screen->nnew || fsock->queue.list.head) {
-	    fsock->world->screen->active = 1;
-            ++active_count;
-            update_status_field(NULL, STAT_ACTIVE);
+	    if (!fsock->world->screen->active) {
+		fsock->world->screen->active = 1;
+		old_marked_active = 1;
+		++active_count;
+		update_status_field(NULL, STAT_ACTIVE);
+		if (!foreground_context_current(sock, generation)) {
+		    fsock->world->screen->active = 0;
+		    --active_count;
+		    update_status_field(NULL, STAT_ACTIVE);
+		    result = 0;
+		    goto done;
+		}
+	    }
 	/* ...is dead, with all text seen */
         } else if (fsock->constate == SS_ZOMBIE) {
             fsock->constate = SS_DEAD;
@@ -1362,17 +1392,25 @@ static int fg_sock(Sock *sock, int quiet)
 	}
     }
     fsock = sock;
-    depth++;
+    saved_prog_context = push_socket_prog_context(
+	&foreground_context, sock, generation);
+    foreground_context_pushed = 1;
 
-    if (!virtscreen) update_status_field(NULL, STAT_WORLD);
-    hide_screen(NULL);
-
-    if (sock) {
-	if (!socket_incarnation_current(sock, generation)) {
+    if (!virtscreen) {
+	update_status_field(NULL, STAT_WORLD);
+	if (!foreground_context_current(sock, generation)) {
+	    restore_foreground = 1;
 	    result = 0;
 	    goto done;
 	}
-	xsock = sock;
+    }
+    hide_screen(NULL);
+
+    if (sock) {
+	if (!foreground_context_current(sock, generation)) {
+	    result = 0;
+	    goto done;
+	}
 	if (sock->alert_id == alert_id) {
 	    clear_alert();
 	    sock->alert_id = 0;
@@ -1381,44 +1419,109 @@ static int fg_sock(Sock *sock, int quiet)
 	    FD_SET(sock->fd, &readers);
         if (sock->world->screen->active) {
 	    sock->world->screen->active = 0;
+	    target_marked_inactive = 1;
             --active_count;
             update_status_field(NULL, STAT_ACTIVE);
-	    if (!socket_incarnation_current(sock, generation)) {
+	    if (!foreground_context_current(sock, generation)) {
+		restore_foreground = 1;
 		result = 0;
 		goto done;
 	    }
-	    xsock = sock;
         }
         fg_screen = sock->world->screen;
 	unhide_screen(fg_screen); /* must do before hook which might oflush */
         world_hook((sock->constate >= SS_ZOMBIE) ?
             "---- World %s (dead) ----" : "---- World %s ----",
            sock->world->name);
-	if (!socket_incarnation_current(sock, generation)) {
+	if (!foreground_context_current(sock, generation)) {
 	    result = 0;
 	    goto done;
 	}
-	xsock = sock;
-	switch_screen(quiet || !bg_output);
+	if (!switch_screen(quiet || !bg_output, sock, generation)) {
+	    result = 0;
+	    goto done;
+	}
         tog_lp(NULL);
         update_prompt(sock->prompt, 1);
+	if (prog_context_cancelled(saved_prog_context))
+	    goto done;
         if (sockmload) {
-	    wload(sock->world);
-	    if (!socket_incarnation_current(sock, generation)) {
+	    if (!wload(sock->world, sock, generation) ||
+		!foreground_context_current(sock, generation))
+	    {
 		result = 0;
 		goto done;
 	    }
-	    xsock = sock;
 	}
     } else {
         fg_screen = default_screen;
 	unhide_screen(fg_screen);
         world_hook("---- No world ----", NULL);
+	if (!foreground_context_current(NULL, 0)) {
+	    result = 0;
+	    goto done;
+	}
 	xsock = NULL;
-	switch_screen(quiet || !bg_output);
+	if (!switch_screen(quiet || !bg_output, NULL, 0)) {
+	    result = 0;
+	    goto done;
+	}
         update_prompt(NULL, 1);
     }
 done:
+    if (!result && foreground_context_pushed)
+	restore_foreground = 1;
+    if (restore_foreground) {
+	ProgContext *cancelled_context = suspend_prog_context();
+	Sock *restore_sock = old_fsock &&
+	    socket_incarnation_current(old_fsock, old_generation) ?
+	    old_fsock : NULL;
+	int active_changed = 0;
+
+	if (restore_sock && old_marked_active &&
+	    restore_sock->world->screen->active)
+	{
+	    restore_sock->world->screen->active = 0;
+	    --active_count;
+	    active_changed = 1;
+	}
+	if (target_marked_inactive && !sock->world->screen->active &&
+	    (sock->world->screen->nnew || sock->queue.list.head))
+	{
+	    sock->world->screen->active = 1;
+	    ++active_count;
+	    active_changed = 1;
+	}
+	if (active_changed) {
+	    update_status_field(NULL, STAT_ACTIVE);
+	    if (restore_sock &&
+		!socket_incarnation_current(restore_sock, old_generation))
+		restore_sock = NULL;
+	}
+
+	do {
+	    hide_screen(NULL);
+	    if (restore_sock && restore_sock->constate == SS_DEAD) {
+		restore_sock->constate = SS_ZOMBIE;
+		--dead_socks;
+	    }
+	    fsock = xsock = restore_sock;
+	    if (restore_sock && restore_sock->constate == SS_CONNECTED)
+		FD_SET(restore_sock->fd, &readers);
+	    fg_screen = restore_sock ? restore_sock->world->screen : default_screen;
+	    unhide_screen(fg_screen);
+	    if (switch_screen(TRUE, restore_sock,
+		socket_generation(restore_sock)))
+	    {
+		update_prompt(restore_sock ? restore_sock->prompt : NULL, 1);
+		break;
+	    }
+	    restore_sock = NULL;
+	} while (1);
+	restore_prog_context(cancelled_context);
+    }
+    if (foreground_context_pushed)
+	restore_prog_context(saved_prog_context);
     depth--;
     return result;
 }
@@ -1478,6 +1581,8 @@ struct Value *handle_fg_command(String *args, int offset)
 int openworld(const char *name, const char *port, int flags)
 {
     World *world = NULL;
+    ProgContext connect_context, *saved_prog_context;
+    int result;
 
     if (!(flags & (CONN_FG | CONN_BG)))
 	flags |= (xsock == fsock) ? CONN_FG : CONN_BG;
@@ -1502,12 +1607,29 @@ int openworld(const char *name, const char *port, int flags)
         }
     }
 
-    return world ? opensock(world, flags) : 0;
+    if (!world) return 0;
+    if (!world->sock || world->sock->constate < SS_ZOMBIE)
+	return opensock(world, flags);
+    if (!current_socket_hook(H_DISCONNECT, world->sock,
+	    world->sock->generation) &&
+	!current_socket_hook(H_CONFAIL, world->sock, world->sock->generation))
+    {
+	return opensock(world, flags);
+    }
+
+    /* A retirement hook may finish replacing its cancelled incarnation. */
+
+    saved_prog_context = push_socket_prog_context(
+	&connect_context, world->sock, world->sock->generation + 1);
+    result = opensock(world, flags);
+    restore_prog_context(saved_prog_context);
+    return result;
 }
 
 static int opensock(World *world, int flags)
 {
     int gai_err;
+    Sock *sock;
     unsigned long generation;
     const char *what;
 
@@ -1516,6 +1638,7 @@ static int opensock(World *world, int flags)
             eprintf("socket to %s already exists", world->name);
             return 0;
         }
+	abort_prog_interpreters(world->sock, world->sock->generation);
         /* recycle existing Sock */
 	if (world->sock->constate == SS_DEAD)
 	    dead_socks--;
@@ -1557,6 +1680,7 @@ static int opensock(World *world, int flags)
     init_queue(&xsock->queue);
     xsock->prompt_timeout = tvzero;
     generation = xsock->generation;
+    sock = xsock;
     xsock->host = NULL;
     xsock->port = NULL;
     xsock->ttype = -1;
@@ -1596,16 +1720,26 @@ static int opensock(World *world, int flags)
     }
 
     if (flags & CONN_FG) {
-	Sock *sock = xsock;
-
-	fg_sock(sock, FALSE); /* XXX 2nd arg??? */
+	if (!fg_sock(sock, FALSE)) { /* XXX 2nd arg??? */
+	    if (socket_incarnation_live(sock, generation) &&
+		sock->constate == SS_NEW)
+	    {
+		killsock(sock);
+	    }
+	    return 0;
+	}
 	if (!socket_incarnation_live(sock, generation) ||
 	    sock->constate != SS_NEW)
 	{
 	    return 0;
 	}
-	xsock = sock;
     }
+    if (current_prog_context_cancelled()) {
+	if (socket_incarnation_live(sock, generation))
+	    killsock(sock);
+	return 0;
+    }
+    xsock = sock;
 
     if (flags & CONN_AUTOLOGIN) xsock->flags |= SOCKLOGIN;
     if (world->flags & WORLD_ECHO) xsock->flags |= SOCKECHO;
@@ -2493,7 +2627,7 @@ ssl_connect_done:
 	if (!resume_socket_establishment(sock, generation)) return 0;
     }
 
-    wload(sock->world);
+    if (!wload(sock->world, sock, generation)) return 0;
     if (!resume_socket_establishment(sock, generation)) return 0;
 
     if (!(sock->flags & SOCKPROXY)) {
@@ -2541,6 +2675,7 @@ static int ssl_check_cert_verify(Sock *sock)
 static void killsock(Sock *sock)
 {
     if (sock->constate >= SS_ZOMBIE) return;
+    abort_prog_interpreters(sock, sock->generation);
     sock->generation++;
 #if 0 /* There may be a disconnect hook AFTER this function... */
     if (sock == fsock || sock->queue.list.head || sock->world->screen->nnew) {
@@ -2633,6 +2768,7 @@ static void clear_socket_queue(Sock *sock)
  */
 static void nukesock(Sock *sock)
 {
+    abort_prog_interpreters(sock, sock->generation);
     if (sock->queue.list.head)
 	internal_error(__FILE__, __LINE__, "socket %s has unprocessed lines",
 	    !sock ? "!sock" :
@@ -2717,6 +2853,7 @@ static void dc(Sock *s)
 {
     Sock *oldxsock;
     unsigned long generation;
+    int callback_retired = 0, caller_cancelled = 0;
     String *buffer;
 
     if (!s || s->constate >= SS_ZOMBIE) return;
@@ -2730,16 +2867,43 @@ static void dc(Sock *s)
     handle_socket_input_queue_lines(s);
 #endif
     flushxsock();
-    if (!socket_input_live(s, generation)) goto done;
+    if (!revalidate_prog_context_socket(s, generation)) {
+	callback_retired = 1;
+	goto done;
+    }
+    if (current_prog_context_cancelled()) {
+	caller_cancelled = 1;
+	goto done;
+    }
     Sprintf(buffer, "%% Connection to %s closed.", s->world->name);
     world_output(s->world, CS(buffer));
-    if (!socket_input_live(s, generation)) goto done;
-    if (xsock != fsock) oputline(CS(buffer));
+    if (!revalidate_prog_context_socket(s, generation)) {
+	callback_retired = 1;
+	goto done;
+    }
+    if (current_prog_context_cancelled()) {
+	caller_cancelled = 1;
+	goto done;
+    }
+    if (xsock != fsock) {
+	oputline(CS(buffer));
+	if (!revalidate_prog_context_socket(s, generation)) {
+	    callback_retired = 1;
+	    goto done;
+	}
+	if (current_prog_context_cancelled()) {
+	    caller_cancelled = 1;
+	    goto done;
+	}
+    }
     zombiesock(s);
 
 done:
     Stringfree(buffer);
-    xsock = oldxsock;
+    if (caller_cancelled)
+	xsock = NULL;
+    else if (!callback_retired)
+	xsock = oldxsock;
 }
 
 /* disconnect a socket */
@@ -2972,14 +3136,15 @@ int send_line_with_hook(conString *string, int eol_flag, int *hooked)
 {
     Sock *sock = xsock;
     unsigned long generation = sock ? sock->generation : 0;
-    int result = 0;
+    int result = 0, valid;
 
     ((String *)string)->links++;
     *hooked = do_hook(H_SEND, NULL, "%S", string);
+    valid = revalidate_prog_context_socket(sock, generation);
     if (!*hooked) {
-	if (!socket_incarnation_current(sock, generation)) {
+	if (!valid)
 	    eprintf("Not connected.");
-	} else {
+	else if (!current_prog_context_cancelled()) {
 	    xsock = sock;
 	    result = send_line(string->data, string->len, eol_flag);
 	}
@@ -3559,7 +3724,11 @@ done:
 void world_output(World *world, conString *line)
 {
     Sock *saved_xsock = xsock;
-    xsock = world ? world->sock : NULL;
+    Sock *output_sock = world ? world->sock : NULL;
+    unsigned long output_generation = socket_generation(output_sock);
+    int output_retired = 0, caller_cancelled = 0;
+
+    xsock = output_sock;
     line->links++;
     recordline(world->history, line);
     record_global(line);
@@ -3568,6 +3737,16 @@ void world_output(World *world, conString *line)
     {
         if (world->sock == fsock) {
             screenout(line);
+	    if (!revalidate_prog_context_socket(
+		    output_sock, output_generation))
+	    {
+		output_retired = 1;
+		goto done;
+	    }
+	    if (current_prog_context_cancelled()) {
+		caller_cancelled = 1;
+		goto done;
+	    }
         } else {
 	    static int preactivity_depth = 0; /* avoid recursion */
 	    /* line was already tested for gag, so it WILL print */
@@ -3575,6 +3754,19 @@ void world_output(World *world, conString *line)
 		preactivity_depth++;
                 do_hook(H_PREACTIVITY, NULL, "%s", world->name);
 		preactivity_depth--;
+		if (world->sock != output_sock ||
+		    !revalidate_prog_context_socket(
+			output_sock, output_generation))
+		{
+		    revalidate_prog_context_socket(
+			output_sock, output_generation);
+		    output_retired = 1;
+		    goto done;
+		}
+		if (current_prog_context_cancelled()) {
+		    caller_cancelled = 1;
+		    goto done;
+		}
 	    }
             enscreen(world->screen, line); /* ignores preactivity_depth */
             if (!preactivity_depth) {
@@ -3582,15 +3774,58 @@ void world_output(World *world, conString *line)
 		    world->screen->active = 1;
 		    ++active_count;
 		    update_status_field(NULL, STAT_ACTIVE);
+		    if (world->sock != output_sock ||
+			!revalidate_prog_context_socket(
+			    output_sock, output_generation))
+		    {
+			revalidate_prog_context_socket(
+			    output_sock, output_generation);
+			output_retired = 1;
+			goto done;
+		    }
+		    if (current_prog_context_cancelled()) {
+			caller_cancelled = 1;
+			goto done;
+		    }
 		    do_hook(H_ACTIVITY, "%% Activity in world %s", "%s",
 			world->name);
+		    if (world->sock != output_sock ||
+			!revalidate_prog_context_socket(
+			    output_sock, output_generation))
+		    {
+			revalidate_prog_context_socket(
+			    output_sock, output_generation);
+			output_retired = 1;
+			goto done;
+		    }
+		    if (current_prog_context_cancelled()) {
+			caller_cancelled = 1;
+			goto done;
+		    }
 		}
 		do_hook(H_BGTEXT, NULL, "%s", world->name);
+		if (world->sock != output_sock ||
+		    !revalidate_prog_context_socket(
+			output_sock, output_generation))
+		{
+		    revalidate_prog_context_socket(
+			output_sock, output_generation);
+		    output_retired = 1;
+		    goto done;
+		}
+		if (current_prog_context_cancelled()) {
+		    caller_cancelled = 1;
+		    goto done;
+		}
             }
         }
     }
+done:
     conStringfree(line);
-    xsock = saved_xsock;
+    if (caller_cancelled)
+	xsock = NULL;
+    else if (!output_retired)
+	xsock = saved_xsock;
 }
 
 /* get the prompt for the fg sock */
@@ -3709,7 +3944,7 @@ int socket_incarnation_current(struct Sock *sock, unsigned long generation)
     return sock && sock->generation == generation;
 }
 
-static int socket_incarnation_live(Sock *sock, unsigned long generation)
+int socket_incarnation_live(Sock *sock, unsigned long generation)
 {
     return socket_incarnation_current(sock, generation) &&
 	sock->constate < SS_ZOMBIE;
@@ -4701,6 +4936,8 @@ static int is_bamf(Sock *sock, unsigned long generation, const char *str)
     smallstr name, host, port;
     STATIC_BUFFER(buffer);
     World *world;
+    ProgContext *cancelled_context = NULL;
+    int result;
 
     if (!bamf || restriction >= RESTRICT_WORLD) return 0;
     if (sscanf(str,
@@ -4723,9 +4960,15 @@ static int is_bamf(Sock *sock, unsigned long generation, const char *str)
 
     do_hook(H_BAMF, "%% Bamfing to %s", "%s", name);
     if (!socket_input_current(sock, generation)) return 1;
-    if (bamf == BAMF_UNTER) killsock(sock);
-    if (!opensock(world, CONN_AUTOLOGIN))
-        eputs("% Connection through portal failed.");
+    if (bamf == BAMF_UNTER) {
+	killsock(sock);
+	cancelled_context = suspend_prog_context();
+    }
+    result = opensock(world, CONN_AUTOLOGIN);
+    if (!result)
+	eputs("% Connection through portal failed.");
+    if (bamf == BAMF_UNTER)
+	restore_prog_context(cancelled_context);
     xsock = sock;
     return 1;
 }

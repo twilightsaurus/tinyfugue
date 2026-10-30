@@ -1927,6 +1927,10 @@ void update_status_field(Var *var, stat_id_t internal)
     int count = 0;
 
     if (screen_mode < 1) return;
+    if (internal == STAT_MORE && display_screen->more_callback_retired) {
+	need_more_refresh = 0;
+	return;
+    }
 
     if (var && var->statusattrs) {
 	if (!ch_attr(var))
@@ -2921,31 +2925,64 @@ static void hwrite(conString *line, int start, int len, int indent)
 void reset_outcount(Screen *screen)
 {
     if (!screen) screen = display_screen;
+    screen->more_callback_retired = 0;
     screen->outcount = visual ?
         (scroll ? (out_bot - out_top + 1) : screen->outcount) :
         lines - 1;
 }
 
-/* return TRUE if okay to print */
+/* return 1 to print, 0 to pause, or -1 if H_MORE retired its socket */
 static int check_more(Screen *screen)
 {
+    Screen *owner = fg_screen;
+    struct Sock *sock;
+    unsigned long generation;
+    int socket_current;
+
     if (!screen->paused && more && tfinteractive && screen->outcount-- <= 0)
     {
         /* status bar is updated in oflush() to avoid scroll region problems */
         screen->paused = 1;
+	screen->more_callback_retired = 0;
+	sock = xsock;
+	generation = socket_generation(sock);
         do_hook(H_MORE, NULL, "");
+	socket_current = revalidate_prog_context_socket(sock, generation);
+	if (current_prog_context_cancelled() ||
+	    (!socket_current && !current_prog_context_active()))
+	{
+	    if (fg_screen == owner) {
+		screen->more_callback_retired = 1;
+		need_more_refresh = 0;
+	    }
+	    return -1;
+	}
     }
     return !screen->paused;
 }
 
 int pause_screen(void)
 {
-    if (display_screen->paused)
+    Screen *screen = display_screen;
+    Screen *owner = fg_screen;
+    struct Sock *sock;
+    unsigned long generation;
+    int socket_current;
+
+    if (screen->paused)
 	return 0;
-    display_screen->outcount = 0;
-    display_screen->paused = 1;
+    screen->outcount = 0;
+    screen->paused = 1;
+    screen->more_callback_retired = 0;
+    sock = xsock;
+    generation = socket_generation(sock);
     do_hook(H_MORE, NULL, "");
-    update_status_field(NULL, STAT_MORE);
+    socket_current = revalidate_prog_context_socket(sock, generation);
+    if (!current_prog_context_cancelled() &&
+	(socket_current || current_prog_context_active()))
+	update_status_field(NULL, STAT_MORE);
+    else if (fg_screen == owner)
+	screen->more_callback_retired = 1;
     return 1;
 }
 
@@ -2953,6 +2990,7 @@ int clear_more(int new)
 {
     PhysLine *pl;
     int use_insert, need_redraw = 0, scrolled = 0;
+    display_screen->more_callback_retired = 0;
 
     if (new < 0) {
 	if (!visual /* XXX || !can_scrollback */) return 0;
@@ -3099,10 +3137,13 @@ int selflush(void)
 
 /* next_physline
  * Increment bottom of screen.  Checks for More and SELFLUSH termination.
- * Returns 1 if there is a displayable line, 0 if not.
+ * Returns 1 for a displayable line, 0 to stop, or -1 for socket retirement.
  */
 static int next_physline(Screen *screen)
 {
+    int more_result;
+    ListEntry *bot, *maxbot;
+    int viewsize;
     if (screen->paused)
 	return 0;
     if (!nextbot(screen)) {
@@ -3119,7 +3160,15 @@ static int next_physline(Screen *screen)
 	}
 	return 0;
     }
-    if (!check_more(screen)) {
+    bot = screen->bot;
+    maxbot = screen->maxbot;
+    viewsize = screen->viewsize;
+    more_result = check_more(screen);
+    if (more_result <= 0) {
+	/* H_MORE may have flushed or otherwise changed the pager. */
+	if (screen->bot != bot || screen->maxbot != maxbot ||
+	    screen->viewsize != viewsize || !screen->paused)
+	    return more_result;
 	/* undo the nextbot() */
 	if (screen->maxbot == screen->bot) {
 	    screen->maxbot = screen->maxbot->prev;
@@ -3130,7 +3179,7 @@ static int next_physline(Screen *screen)
 	screen->nback_filtered++;
 	screen->nback++;
 	screen->viewsize--;
-	return 0;
+	return more_result;
     }
     if (display_screen->viewsize > winlines())
 	nexttop(screen);
@@ -3317,7 +3366,7 @@ void enscreen(Screen *screen, conString *line)
 void oflush(void)
 {
     static int lastsize;
-    int waspaused, count = 0;
+    int waspaused, count = 0, next_result;
     PhysLine *pl;
     Screen *screen = display_screen;
 
@@ -3325,7 +3374,7 @@ void oflush(void)
 
     if (!(waspaused = screen->paused)) {
         lastsize = 0;
-        while (next_physline(screen)) {
+        while ((next_result = next_physline(screen)) > 0) {
             pl = screen->bot->datum;
             if (count++ == 0) {  /* first iteration? */
                 if (screen_mode < 1) {
@@ -3346,6 +3395,8 @@ void oflush(void)
             set_refresh_pending(REF_PHYSICAL);
             bufflush();
         }
+	if (next_result < 0)
+	    return;
     }
 
     if (screen->paused) {
@@ -3477,8 +3528,16 @@ void unhide_screen(Screen *screen)
 /*
  * Switch to new fg_screen.
  */
-void switch_screen(int quiet)
+static int switch_screen_context_current(struct Sock *sock,
+    unsigned long generation)
 {
+    return revalidate_prog_context_socket(sock, generation) &&
+	!current_prog_context_cancelled();
+}
+
+int switch_screen(int quiet, struct Sock *sock, unsigned long generation)
+{
+    display_screen->more_callback_retired = 0;
     if (fg_screen != display_screen) {	/* !virtscreen */
         /* move lines from fg_screen to display_screen */
 	/* XXX optimize when no filter */
@@ -3505,6 +3564,8 @@ void switch_screen(int quiet)
         fg_screen->maxbot = fg_screen->bot = fg_screen->top = NULL;
     }
     update_status_field(NULL, STAT_WORLD);
+    if (!switch_screen_context_current(sock, generation))
+	return 0;
     if (quiet) {
         /* jump to end */
 	screen_end(1);
@@ -3514,8 +3575,11 @@ void switch_screen(int quiet)
 	}
 	/* display new lines */
 	oflush();
+	if (!switch_screen_context_current(sock, generation))
+	    return 0;
 	update_status_field(NULL, STAT_MORE);
     }
+    return switch_screen_context_current(sock, generation);
 }
 
 #if USE_DMALLOC

@@ -24,6 +24,14 @@ typedef struct {
 } Process;
 #endif
 
+typedef struct ProgContext {
+    struct Sock *sock;
+    unsigned long generation;
+    int cancelled;
+    struct ProgContext *parent;
+    struct ProgContext *previous_active;
+} ProgContext;
+
 extern void init_expand(void);
 extern void prog_free(Program *prog);
 extern int prog_run(const Program *prog, const String *args, int offset,
@@ -33,6 +41,19 @@ extern struct Program *compile_tf(conString *body, int bodystart, int subs,
 extern int macro_run(conString *body, int boffset, String *args, int offset,
     int subs, const char *name);
 extern Value *prog_interpret(const Program *prog, int in_expr);
+extern ProgContext *push_socket_prog_context(ProgContext *context,
+    struct Sock *sock, unsigned long generation);
+extern ProgContext *push_dependent_socket_prog_context(ProgContext *context,
+    struct Sock *sock, unsigned long generation);
+extern ProgContext *suspend_prog_context(void);
+extern void restore_prog_context(ProgContext *context);
+extern void abort_prog_interpreters(struct Sock *sock,
+    unsigned long generation);
+extern int revalidate_prog_context_socket(struct Sock *sock,
+    unsigned long generation);
+extern int current_prog_context_cancelled(void);
+extern int current_prog_context_active(void);
+extern int prog_context_cancelled(const ProgContext *context);
 extern String *do_mprefix(void);
 extern const char **keyword(const char *id);
 extern void eat_newline(Program *prog);

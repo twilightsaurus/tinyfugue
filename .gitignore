@@ -8,6 +8,10 @@
 *.lib
 *.a
 
+
+# Python bytecode
+__pycache__/
+*.py[cod]
 #
 config.log
 aclocal.m4

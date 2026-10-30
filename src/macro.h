@@ -9,6 +9,8 @@
 #ifndef MACRO_H
 #define MACRO_H
 
+struct Sock;
+
 enum { USED_NAME, USED_TRIG, USED_HOOK, USED_KEY, USED_N }; /* for Macro.used */
 
 extern int invis_flag;
@@ -34,6 +36,8 @@ extern int    do_macro(Macro *macro, String *args, int offset,
 extern const char *macro_body(const char *name);
 extern int    find_and_run_matches(String *text, int hooknum, String **linep,
 		struct World *world, int globalflag, int exec_list_long);
+extern int    current_socket_hook(int hooknum, struct Sock *sock,
+		unsigned long generation);
 
 #define macro_hash(name) \
     (!name ? 0 : (*name == '#') ? atoi(name + 1) : hash_string(name))

@@ -26,6 +26,8 @@ extern struct Sock *xsock;
 extern unsigned long socket_generation(const struct Sock *sock);
 extern int     socket_incarnation_current(struct Sock *sock,
 		    unsigned long generation);
+extern int     socket_incarnation_live(struct Sock *sock,
+		    unsigned long generation);
 
 extern void    main_loop(void);
 extern void    init_sock(void);

@@ -26,6 +26,8 @@
 # define S_IROTH 00004
 #endif
 
+
+struct Sock;
 /* TFILE types */
 typedef enum { TF_NULL, TF_QUEUE, TF_FILE, TF_PIPE } TFILE_type_t;
 
@@ -73,6 +75,7 @@ struct Screen {
     char needs_refilter;	/* top and bot need to be recalculated */
     char partialview;		/* do not expand viewsize to fit terminal */
     char paused;		/* paused at a More prompt? */
+    char more_callback_retired;	/* suppress status after H_MORE retirement */
     char active;		/* has new lines without the A attribute? */
 };
 
@@ -165,6 +168,7 @@ extern struct String *tfgetS(struct String *str, TFILE *file);
 
 extern void   hide_screen(Screen *screen);
 extern void   unhide_screen(Screen *screen);
-extern void   switch_screen(int quiet);
+extern int    switch_screen(int quiet, struct Sock *sock,
+		     unsigned long generation);
 
 #endif /* TFIO_H */

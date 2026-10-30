@@ -468,6 +468,159 @@ static void do_mecho(const Program *prog, int i)
 	    mecho_attr);
     }
 }
+/*
+ * current_prog_context is inherited by synchronous nested interpreters.
+ * active_prog_contexts also contains contexts suspended by a recursive
+ * main_loop(), so retirement can cancel every dependent frame without
+ * cancelling unrelated event contexts.
+ */
+static ProgContext *current_prog_context = NULL;
+static ProgContext *active_prog_contexts = NULL;
+
+static void init_prog_context(ProgContext *context, struct Sock *sock,
+    unsigned long generation)
+{
+    context->sock = sock;
+    context->generation = generation;
+    context->cancelled = 0;
+    context->parent = NULL;
+    context->previous_active = active_prog_contexts;
+    active_prog_contexts = context;
+}
+
+ProgContext *push_socket_prog_context(ProgContext *context,
+    struct Sock *sock, unsigned long generation)
+{
+    ProgContext *previous = current_prog_context;
+
+    /* A nested interpreter with the same owner shares its cancellation. */
+    if (!current_prog_context ||
+	current_prog_context->sock != sock ||
+	current_prog_context->generation != generation)
+    {
+	init_prog_context(context, sock, generation);
+	current_prog_context = context;
+    }
+    return previous;
+}
+
+ProgContext *push_dependent_socket_prog_context(ProgContext *context,
+    struct Sock *sock, unsigned long generation)
+{
+    ProgContext *previous =
+	push_socket_prog_context(context, sock, generation);
+
+    if (current_prog_context == context)
+	context->parent = previous;
+    return previous;
+}
+
+
+ProgContext *suspend_prog_context(void)
+{
+    ProgContext *previous = current_prog_context;
+
+    current_prog_context = NULL;
+    return previous;
+}
+
+void restore_prog_context(ProgContext *context)
+{
+    if (current_prog_context && current_prog_context != context) {
+	if (active_prog_contexts != current_prog_context)
+	    internal_error(__FILE__, __LINE__, "invalid program context");
+	active_prog_contexts = current_prog_context->previous_active;
+    }
+    current_prog_context = context;
+}
+
+void abort_prog_interpreters(struct Sock *sock, unsigned long generation)
+{
+    ProgContext *context;
+
+    for (context = active_prog_contexts; context;
+	context = context->previous_active)
+    {
+	if (context->sock == sock && context->generation == generation) {
+	    context->cancelled = 1;
+	    context->sock = NULL;
+	}
+    }
+}
+
+int prog_context_cancelled(const ProgContext *context)
+{
+    for (; context; context = context->parent) {
+	if (context->cancelled)
+	    return 1;
+    }
+    return 0;
+}
+
+int current_prog_context_cancelled(void)
+{
+    return current_prog_context && prog_context_cancelled(current_prog_context);
+}
+
+int current_prog_context_active(void)
+{
+    return current_prog_context != NULL;
+}
+
+int revalidate_prog_context_socket(struct Sock *sock,
+    unsigned long generation)
+{
+    if (!sock) {
+	xsock = NULL;
+	return 1;
+    }
+    if (socket_incarnation_current(sock, generation)) {
+	xsock = sock;
+	return 1;
+    }
+
+    abort_prog_interpreters(sock, generation);
+    if (!current_prog_context) {
+	/*
+	 * A main_loop() event has no interpreter owner.  Keep its replacement
+	 * socket operational until the loop advances; the suspended owner is
+	 * restored when the recursive loop returns.
+	 */
+	xsock = sock;
+    } else {
+	xsock = current_prog_context->sock &&
+	    socket_incarnation_current(current_prog_context->sock,
+		current_prog_context->generation) ?
+	    current_prog_context->sock : NULL;
+    }
+    return 0;
+}
+
+static int revalidate_prog_output(ProgContext *context, struct Sock *sock,
+    unsigned long generation)
+{
+    revalidate_prog_context_socket(sock, generation);
+    if (context->sock &&
+	!socket_incarnation_current(context->sock, context->generation))
+    {
+	abort_prog_interpreters(context->sock, context->generation);
+    }
+
+    return prog_context_cancelled(context);
+}
+
+
+static String *pop_buffer(void)
+{
+    Value *saved = popval();
+    String *result = (String *)valstr(saved);
+
+    result->links++;
+    freeval(saved);
+    return result;
+}
+
+
 
 Value *prog_interpret(const Program *prog, int in_expr)
 {
@@ -481,10 +634,12 @@ Value *prog_interpret(const Program *prog, int in_expr)
     int instruction_count = 0;
     String *buf;
     const char *cstr, *old_cmd;
+    ProgContext local_context, *context, *saved_context;
     struct tf_frame {
 	TFILE *orig_tfin, *orig_tfout;	/* restored when done */
 	TFILE *local_tfin, *local_tfout;/* restored after pipes */
 	TFILE *inpipe, *outpipe;	/* pipes between commands */
+	struct tf_frame *parent;
     } first_frame, *frame;
 #if 0
     TFILE **filep;
@@ -496,11 +651,21 @@ Value *prog_interpret(const Program *prog, int in_expr)
     frame->local_tfin = frame->orig_tfin = tfin;
     frame->local_tfout = frame->orig_tfout = tfout;
     frame->inpipe = frame->outpipe = NULL;
+    frame->parent = NULL;
+
+    saved_context = current_prog_context;
+    if (!current_prog_context) {
+	init_prog_context(&local_context, NULL, 0);
+	current_prog_context = &local_context;
+    }
+    context = current_prog_context;
 
     (buf = Stringnew(NULL, 0, 0))->links++;
     stackbot = stacktop;
 
     for (cip = 0; cip < prog->len; cip++) {
+	if (prog_context_cancelled(context))
+	    goto prog_interpret_exit;
 	if (exiting) break;
 	if (interrupted()) {
 	    eprintf("Macro execution interrupted.");
@@ -512,8 +677,24 @@ Value *prog_interpret(const Program *prog, int in_expr)
 	}
 	instruction_count++;
 	op = prog->code[cip].op;
-	if (mecho > invis_flag) do_mecho(prog, cip);
-	if (iecho > invis_flag) inst_dump(prog, cip, 'i');
+	if (mecho > invis_flag) {
+	    struct Sock *echo_sock = xsock;
+	    unsigned long echo_generation = socket_generation(echo_sock);
+
+	    do_mecho(prog, cip);
+	    if (revalidate_prog_output(
+		    context, echo_sock, echo_generation))
+		goto prog_interpret_exit;
+	}
+	if (iecho > invis_flag) {
+	    struct Sock *echo_sock = xsock;
+	    unsigned long echo_generation = socket_generation(echo_sock);
+
+	    inst_dump(prog, cip, 'i');
+	    if (revalidate_prog_output(
+		    context, echo_sock, echo_generation))
+		goto prog_interpret_exit;
+	}
 
 	if (op_type_is(op, EXPR)) {
 	    if (!reduce(op, prog->code[cip].arg.i))
@@ -681,19 +862,23 @@ Value *prog_interpret(const Program *prog, int in_expr)
 	    setup_next_io();
 	    break;
 	case OP_PUSHBUF:
-	    if (!pushval(newptr(buf))) /* XXX optimize */
+	    if (!pushval(newSstr(CS(buf))))
 		goto prog_interpret_exit;
+	    Stringfree(buf); /* ownership transferred to the stack value */
 	    (buf = Stringnew(NULL, 0, 0))->links++;
 	    break;
 	case OP_POPBUF:
 	    Stringfree(buf);
-	    buf = valptr(popval()); /* XXX optimize */
-	    freeval(opd(0));
+	    buf = pop_buffer();
 	    break;
 	case OP_CMDSUB:
 	    if (!pushval(newptr(frame))) /* XXX optimize */
 		goto prog_interpret_exit;
-	    frame = XMALLOC(sizeof(*frame));
+	    {
+		struct tf_frame *parent = frame;
+		frame = XMALLOC(sizeof(*frame));
+		frame->parent = parent;
+	    }
 	    frame->local_tfout = tfout = tfopen(NULL, "q");
 	    frame->local_tfin = tfin;
 	    frame->inpipe = frame->outpipe = NULL;
@@ -738,8 +923,7 @@ Value *prog_interpret(const Program *prog, int in_expr)
 	    break;
 	case OP_PBUF:
 	    constr = CS(buf);
-	    buf = valptr(popval()); /* XXX optimize */
-	    freeval(opd(0));
+	    buf = pop_buffer();
 	    if (!pushval(newSstr(constr)))
 		goto prog_interpret_exit;
 	    conStringfree(constr);
@@ -750,11 +934,19 @@ Value *prog_interpret(const Program *prog, int in_expr)
 		constr->links++;
 	    } else {
 		constr = CS(buf);
-		buf = valptr(popval()); /* XXX optimize */
-		freeval(opd(0));
+		buf = pop_buffer();
 	    }
 	    if (!(cstr = macro_body(constr->data))) {
+		struct Sock *echo_sock = xsock;
+		unsigned long echo_generation = socket_generation(echo_sock);
+
 		tfprintf(tferr, "%% macro not defined: %S", constr);
+		if (revalidate_prog_output(
+			context, echo_sock, echo_generation))
+		{
+		    conStringfree(constr);
+		    goto prog_interpret_exit;
+		}
 	    }
 	    if (op_is_push(op)) {
 		if (!pushval(newstr(cstr ? cstr : "", -1)))
@@ -762,9 +954,19 @@ Value *prog_interpret(const Program *prog, int in_expr)
 	    } else if (cstr) {
 		Stringcat(buf, cstr);
 	    }
-	    if (mecho > invis_flag)
+	    if (mecho > invis_flag) {
+		struct Sock *echo_sock = xsock;
+		unsigned long echo_generation = socket_generation(echo_sock);
+
 		tfprintf(tferr, "%S$%S --> %s%A", do_mprefix(), constr, cstr,
 		    mecho_attr);
+		if (revalidate_prog_output(
+			context, echo_sock, echo_generation))
+		{
+		    conStringfree(constr);
+		    goto prog_interpret_exit;
+		}
+	    }
 	    conStringfree(constr);
 	    break;
 	case OP_AVAR:
@@ -915,6 +1117,9 @@ Value *prog_interpret(const Program *prog, int in_expr)
 	}
     }
 
+    if (prog_context_cancelled(context))
+	goto prog_interpret_exit;
+
     if (stacktop == stackbot + in_expr) {
 	if (in_expr) {
 	    result = popval();
@@ -933,13 +1138,34 @@ Value *prog_interpret(const Program *prog, int in_expr)
 	internal_error(__FILE__, __LINE__, "invalid frame");
 
 prog_interpret_exit:
-    frame = &first_frame; /* if loop aborted, frame may be wrong */
-    tfin = frame->orig_tfin;
-    tfout = frame->orig_tfout;
+    while (frame != &first_frame) {
+	struct tf_frame *parent = frame->parent;
+	if (frame->inpipe)
+	    tfclose(frame->inpipe);
+	if (frame->outpipe && frame->outpipe != frame->inpipe)
+	    tfclose(frame->outpipe);
+	if (frame->local_tfout != frame->inpipe &&
+	    frame->local_tfout != frame->outpipe)
+	{
+	    tfclose(frame->local_tfout);
+	}
+	FREE(frame);
+	frame = parent;
+    }
+    if (first_frame.inpipe)
+	tfclose(first_frame.inpipe);
+    if (first_frame.outpipe &&
+	first_frame.outpipe != first_frame.inpipe)
+    {
+	tfclose(first_frame.outpipe);
+    }
+    tfin = first_frame.orig_tfin;
+    tfout = first_frame.orig_tfout;
 
     while (stacktop > stackbot)
 	freeval(popval());
     Stringfree(buf);
+    restore_prog_context(saved_context);
     return result;
 }
 

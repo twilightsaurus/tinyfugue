@@ -108,6 +108,14 @@ static Macro *dead_macros;		/* head of list of dead macros */
 static HashTable macro_table[1];	/* macros hashed by name */
 static World NoWorld, AnyWorld;		/* explicit "no" and "any" */
 static int mnum = 0;			/* macro ID number */
+typedef struct hookframe {
+    int hooknum;
+    struct Sock *sock;
+    unsigned long generation;
+    struct hookframe *previous;
+} hookframe_t;
+static hookframe_t *active_hook = NULL;
+
 
 typedef enum {
     HT_TEXT = 0x00,	/* normal text in fg world */
@@ -1544,6 +1552,22 @@ const char *macro_body(const char *name)
 /****************************************
  * Routines to check triggers and hooks *
  ****************************************/
+int current_socket_hook(int hooknum, struct Sock *sock,
+    unsigned long generation)
+{
+    hookframe_t *frame;
+
+    for (frame = active_hook; frame; frame = frame->previous) {
+	if (frame->hooknum == hooknum && frame->sock == sock &&
+	    frame->generation == generation)
+	    return TRUE;
+    }
+    return FALSE;
+}
+
+
+
+
 
 /* do_hook
  * Call macros that match <hooknum> and optionally the filled-in <argfmt>, and
@@ -1555,10 +1579,18 @@ int do_hook(int hooknum, const char *fmt, const char *argfmt, ...)
 {
     va_list ap;
     int ran = 0;
+    hookframe_t frame;
     String *line = NULL;
     String *args = NULL;
     /* do_hook is re-entrant, so we can't use static buffer.  macro regexps
      * may save a pointer to args, so we can't even use an auto buffer. */
+    frame.hooknum = hooknum;
+    frame.sock = xsock;
+    frame.generation = socket_generation(xsock);
+    frame.previous = active_hook;
+    active_hook = &frame;
+
+
 
     va_start(ap, argfmt);
     if (hookflag || hilite || gag) {
@@ -1586,6 +1618,7 @@ int do_hook(int hooknum, const char *fmt, const char *argfmt, ...)
     if (line) {
         Stringfree(line);
     }
+    active_hook = frame.previous;
     return ran;
 }
 
@@ -1601,6 +1634,15 @@ match_pattern_and_attrib_checks(String *text, Pattern *pattern, Macro *macro)
 	return (text->attrs == macro->match_attr)
 	    && patmatch(pattern, CS(text), NULL);
 }
+
+static int listing_context_current(struct Sock *sock,
+    unsigned long generation, const ProgContext *saved_prog_context)
+{
+    return revalidate_prog_context_socket(sock, generation) &&
+	!current_prog_context_cancelled() &&
+	!prog_context_cancelled(saved_prog_context);
+}
+
 
 /* Find and run one or more matches for a hook or trig.
  * text is text to be matched; if NULL, *linep is used.
@@ -1625,6 +1667,7 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
     struct Sock *matchsock;
     unsigned long match_generation;
     int context_valid = 1;
+    ProgContext match_context, *saved_prog_context;
 
     /* Macros are sorted by decreasing priority, with fall-thrus first.  So,
      * we search the global and world lists in parallel.  For each matching
@@ -1646,8 +1689,11 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
      * after itself in a list.
      */
 
+    /* A hook or trigger is owned by the socket incarnation that selected it. */
     matchsock = xsock;
     match_generation = socket_generation(matchsock);
+    saved_prog_context = push_socket_prog_context(
+	&match_context, matchsock, match_generation);
 
     if (world)
 	worldtype = world_type(world);
@@ -1669,7 +1715,9 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 	init_queue(runq);
     }
 
-    while ((gnode || wnode) && context_valid) {
+    while ((gnode || wnode) && context_valid &&
+	(exec_list_long || !current_prog_context_cancelled()))
+    {
 	nodep = (!wnode) ? &gnode : (!gnode) ? &wnode :
 	    (rpricmp(MAC(wnode), MAC(gnode)) > 0) ? &gnode : &wnode;
 	macro = MAC(*nodep);
@@ -1703,11 +1751,12 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 	    result = expr_value_safe(macro->exprprog);
             expr_condition = valbool(result);
             freeval(result);
-	    context_valid = !matchsock ||
-		socket_incarnation_current(matchsock, match_generation);
+	    context_valid = exec_list_long ?
+		listing_context_current(
+		    matchsock, match_generation, saved_prog_context) :
+		(revalidate_prog_context_socket(matchsock, match_generation) &&
+		    !current_prog_context_cancelled());
 	    if (!context_valid) break;
-	    if (matchsock)
-		xsock = matchsock;
             if (!expr_condition) continue;
         }
         pattern = hooknum>=0 ? &macro->hargs : &macro->trig;
@@ -1737,9 +1786,8 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 			    text = *linep;
 			    text->links++;
 			}
-			context_valid = !matchsock ||
-			    socket_incarnation_current(matchsock,
-				match_generation);
+			context_valid = revalidate_prog_context_socket(
+			    matchsock, match_generation);
 		    }
 		} else {
 		    /* collect list of non-fall-thru matches */
@@ -1753,16 +1801,25 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 		if (header < 3 && macro->pri < lowerlimit) {
 		    oputs("% The following matching macros would not be "
 			"applied:");
+		    context_valid = listing_context_current(
+			matchsock, match_generation, saved_prog_context);
+		    if (!context_valid) break;
 		    header = 3;
 		}
 		if (header < 2 && !macro->fallthru) {
 		    oprintf("%% One of the following macros would %sbe "
 			"applied:", ran > 1 ? "also " : "");
+		    context_valid = listing_context_current(
+			matchsock, match_generation, saved_prog_context);
+		    if (!context_valid) break;
 		    lowerlimit = macro->pri;
 		    header = 2;
 		}
 		if (header < 1) {
 		    oputs("% All of the following macros would be applied:");
+		    context_valid = listing_context_current(
+			matchsock, match_generation, saved_prog_context);
+		    if (!context_valid) break;
 		    header = 1;
 		}
 		if (exec_list_long > 1)
@@ -1773,13 +1830,15 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 		else
 		    oprintf("%% %c %10d #%d", macro->fallthru ? 'F' :' ',
 			macro->pri, macro->num);
+		context_valid = listing_context_current(
+		    matchsock, match_generation, saved_prog_context);
 	    }
         }
     }
 
     if (exec_list_long == 0) {
 	/* select exactly one of the non fall-thrus. */
-	if (context_valid && num > 0) {
+	if (context_valid && !current_prog_context_cancelled() && num > 0) {
 	    for (macro = nonfallthru, num = RRAND(0, num-1); num; num--)
 		macro = macro->tnext;
 	    if (linep && *linep)
@@ -1788,8 +1847,8 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 		enqueue(runq, macro);
 	    } else {
 		ran += run_match(macro, text, hooknum);
-		context_valid = !matchsock ||
-		    socket_incarnation_current(matchsock, match_generation);
+		context_valid = revalidate_prog_context_socket(
+		    matchsock, match_generation);
 	    }
 	}
 
@@ -1803,15 +1862,15 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 		 * clobber the alert */
 		if (xworld())
 		    world_output(xworld(), CS(*linep));
-		context_valid = !matchsock ||
-		    socket_incarnation_current(matchsock, match_generation);
+		context_valid = revalidate_prog_context_socket(
+		    matchsock, match_generation);
 		if (context_valid && !xsock_is_fg())
 		    alert(CS(*linep));
 	    } else {
 		tfputline(CS(*linep), tferr); /* XXX conStr bug??? */
 	    }
-	    context_valid = !matchsock ||
-		socket_incarnation_current(matchsock, match_generation);
+	    context_valid = revalidate_prog_context_socket(
+		matchsock, match_generation);
 	    if (context_valid &&
 		(hook_table[hooknum].hooktype & HT_XSOCK))
 	    {
@@ -1820,21 +1879,34 @@ int find_and_run_matches(String *text, int hooknum, String **linep,
 	}
 
 	/* run all of the queued macros */
-	while (context_valid && (macro = (Macro*)dequeue(runq))) {
+	while (context_valid && !current_prog_context_cancelled() &&
+	    (macro = (Macro*)dequeue(runq)))
+	{
 	    ran += run_match(macro, text, hooknum);
-	    context_valid = !matchsock ||
-		socket_incarnation_current(matchsock, match_generation);
+	    context_valid = revalidate_prog_context_socket(
+		matchsock, match_generation) && !current_prog_context_cancelled();
 	}
 	while (dequeue(runq))
-	    /* discard callbacks belonging to a retired incarnation */;
-    } else {
+	    /* discard callbacks belonging to a retired or cancelled context */;
+    } else if (context_valid) {
 	oprintf("%% %s would have %s %d macro%s.",
 	    hooknum>=0 ? "Event" : "Text", hooknum>=0 ? "hooked" : "triggered",
 	    ran, (ran != 1) ? "s" : "");
+	context_valid = listing_context_current(
+	    matchsock, match_generation, saved_prog_context);
     }
 
     recur_count--;
     Stringfree(text);
+    restore_prog_context(saved_prog_context);
+    if (!context_valid) {
+	if (saved_prog_context) {
+	    revalidate_prog_context_socket(saved_prog_context->sock,
+		saved_prog_context->generation);
+	} else {
+	    xsock = matchsock;
+	}
+    }
     return ran;
 }
 
@@ -1946,6 +2018,7 @@ static int run_match(
 {
     int ran = 0;
     struct Sock *callingsock = xsock;
+    unsigned long calling_generation = socket_generation(callingsock);
     RegInfo *old;
 
     if (hooknum < 0) { /* trigger */
@@ -1961,6 +2034,7 @@ static int run_match(
     /* Execute the macro. */
     if ((hooknum>=0 && hookflag) || (hooknum<0 && borg)) {
 	callingsock = xsock;
+	calling_generation = socket_generation(callingsock);
         if (macro->prob == 100 || RRAND(0, 99) < macro->prob) {
             if (macro->shots && !--macro->shots) kill_macro(macro);
             if (mecho > macro->invis) {
@@ -1972,17 +2046,23 @@ static int run_match(
                     *macro->name ? macro->name : numbuf,
 		    text, mecho_attr);
             }
+		if (!revalidate_prog_context_socket(
+			callingsock, calling_generation) ||
+		    current_prog_context_cancelled())
+		    goto done;
             if (macro->body && macro->body->len) {
                 do_macro(macro, text, 0, hooknum>=0 ? USED_HOOK : USED_TRIG, 0);
                 ran += !macro->quiet;
             }
         }
 
+done:
 	/* Restore xsock, in case macro called fg_sock().  main_loop() will
 	 * set xsock=fsock, so any fg_sock() will effect xsock after the
-	 * find_and_run_matches() loop is complete.
+	 * find_and_run_matches() loop is complete.  If the calling socket
+	 * retired, restore the surviving interpreter's owner instead.
 	 */
-	xsock = callingsock;
+	revalidate_prog_context_socket(callingsock, calling_generation);
     }
 
     if (text)

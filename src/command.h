@@ -9,6 +9,8 @@
 #ifndef COMMAND_H
 #define COMMAND_H
 
+struct Sock;
+
 typedef struct Value *(Handler)(String *args, int offset);
 
 typedef struct BuiltinCmd {
@@ -23,6 +25,9 @@ extern int exiting;
 extern int      handle_command(const conString *cmd_line);
 extern BuiltinCmd *find_builtin_cmd(const char *cmd);
 extern int      do_file_load(const char *args, int tinytalk, char**foundname);
+extern int      do_file_load_for_socket(const char *args, int tinytalk,
+		     char **foundname, struct Sock *sock,
+		     unsigned long generation);
 extern int      handle_echo_func(conString *string, const char *attrstr,
                      int inline_flag, const char *dest);
 extern int      handle_substitute_func(conString *string,

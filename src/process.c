@@ -56,6 +56,7 @@ typedef struct Proc {
     char state;
     int disp;           	/* disposition: what to do w/ generated text */
     int count;
+    int result;			/* completed teardown result */
     int (*func)(struct Proc *proc);
     struct timeval ptime;	/* delay */
     struct timeval timer;	/* time of next execution */
@@ -250,7 +251,8 @@ static struct Value *newproc(int type, int (*func)(Proc *proc), int count,
         return killproc(proc, 1);  /* no nuke! */
     }
     if (lpquote || proc->ptime.tv_sec == PTIME_PROMPT) {
-	runproc(proc);	/* XXX should do this asynchronously, in main loop */
+	if (!runproc(proc) && proc->state != PROC_DEAD)
+	    killproc(proc, 0);
     } else if (tvcmp(&proctime, &tvzero) == 0 ||
 	tvcmp(&proc->timer, &proctime) < 0)
     {
@@ -261,19 +263,19 @@ static struct Value *newproc(int type, int (*func)(Proc *proc), int count,
 
 static struct Value *killproc(Proc *proc, int needresult)
 {
-    int result = 1;
+    if (proc->state != PROC_DEAD) {
+	proc->result = 1;
+	proc->state = PROC_DEAD;
+	do_hook(H_KILL, NULL, "%d", proc->pid);
 
-    proc->state = PROC_DEAD;
-    do_hook(H_KILL, NULL, "%d", proc->pid);
-
-    if (proc->type == P_QSHELL) readers_clear(fileno(proc->input->u.fp));
-    if (proc->input) result = tfclose(proc->input);
-
-    if (proc->type == P_QFILE) result = result + 1;
+	if (proc->type == P_QSHELL) readers_clear(fileno(proc->input->u.fp));
+	if (proc->input) proc->result = tfclose(proc->input);
+	if (proc->type == P_QFILE) proc->result++;
+    }
 
     if (!needresult) return NULL;
     if (proc->type == P_QLOCAL || proc->type == P_REPEAT) return_user_result();
-    else return newint(result);
+    else return newint(proc->result);
 }
 
 static void nukeproc(Proc *proc)
@@ -373,7 +375,8 @@ void runall(int prompted, World *world)
 	promptable = (lpquote || proc->ptime.tv_sec == PTIME_PROMPT);
         if (proc->type == P_QSHELL) {
             if (is_active(fileno(proc->input->u.fp))) {
-                if (!(resched = runproc(proc)))
+                if (!(resched = runproc(proc)) &&
+		    proc->state != PROC_DEAD)
                     killproc(proc, 0);  /* no nuke! */
 	    } else if (promptable != prompted) {
 		continue;
@@ -390,7 +393,7 @@ void runall(int prompted, World *world)
 	} else if (promptable != prompted) {
 	    continue;
 	} else if (promptable || tvcmp(&proc->timer, &now) <= 0) {
-            if (!(resched = runproc(proc)))
+            if (!(resched = runproc(proc)) && proc->state != PROC_DEAD)
                 killproc(proc, 0);  /* no nuke! */
         } else resched = TRUE;
 
@@ -408,10 +411,17 @@ static int runproc(Proc *p)
     int done;
     struct Sock *oldsock;
     struct timeval now;
+    ProgContext proc_context, *saved_prog_context;
 
+    /* Processes are independent events, optionally owned by their world. */
     oldsock = xsock;
     if (p->world) xsock = p->world->sock;
+    saved_prog_context = push_socket_prog_context(
+	&proc_context, p->world ? xsock : NULL, socket_generation(xsock));
     done = !(*p->func)(p);
+    if (current_prog_context_cancelled())
+	done = TRUE;
+    restore_prog_context(saved_prog_context);
     xsock = oldsock;
     if (!done && p->ptime.tv_sec >= PTIME_VAR) {   /* timed */
         tvadd(&p->timer, &p->timer,
@@ -466,6 +476,10 @@ static int do_quote(Proc *proc)
     if (proc->type == P_QSHELL) readers_clear(fileno(proc->input->u.fp));
     if (qecho)
 	tfprintf(tferr, "%S%S%A", qprefix, buffer, getattrvar(VAR_qecho_attr));
+    if (current_prog_context_cancelled()) {
+	Stringfree(buffer);
+	return FALSE;
+    }
     switch (proc->disp) {
     case DISP_ECHO:
         oputline(CS(buffer));

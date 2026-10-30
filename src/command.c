@@ -38,6 +38,15 @@ static int quietload = 0;
 
 static void split_args(char *args);
 
+static int file_load_context_current(struct Sock *sock,
+    unsigned long generation)
+{
+    if (sock && !socket_incarnation_current(sock, generation))
+	return revalidate_prog_context_socket(sock, generation) &&
+	    !current_prog_context_cancelled();
+    return !current_prog_context_cancelled();
+}
+
 static BuiltinCmd cmd_table[] =
 {
 #define defcmd(name, func, reserved) \
@@ -494,7 +503,8 @@ struct Value *handle_unlimit_command(String *args, int offset)
  * success. If savename!=NULL and the file is found, *savename will be set to
  * strdup(file->name) and it's up to you to free() it.
  */
-int do_file_load(const char *args, int tinytalk, char **savename)
+static int do_file_load_internal(const char *args, int tinytalk,
+    char **savename, struct Sock *sock, unsigned long generation)
 {
     AUTO_BUFFER(line);
     AUTO_BUFFER(cmd);
@@ -539,6 +549,12 @@ int do_file_load(const char *args, int tinytalk, char **savename)
 	}
     }
 
+    if (!file_load_context_current(sock, generation)) {
+	if (file)
+	    tfclose(file);
+	return 0;
+    }
+
     if (!file) {
         if (!tinytalk || errno != ENOENT)
             do_hook(H_LOADFAIL, "!%s: %s", "%s %s", args, strerror(errno));
@@ -547,10 +563,17 @@ int do_file_load(const char *args, int tinytalk, char **savename)
 
     do_hook(H_LOAD, quietload ? NULL : "%% Loading commands from %s.",
         "%s", file->name);
-	if( savename )
-		*savename = strdup( file->name );
+    if (!file_load_context_current(sock, generation)) {
+	tfclose(file);
+	return 0;
+    }
+    if (savename)
+	*savename = strdup(file->name);
     oflush();  /* Load could take awhile, so flush pending output first. */
-
+    if (!file_load_context_current(sock, generation)) {
+	tfclose(file);
+	return 0;
+    }
     Stringninit(line, 80);
     Stringninit(cmd, 192);
     loadstart = loadline = 0;
@@ -574,10 +597,16 @@ int do_file_load(const char *args, int tinytalk, char **savename)
 	    continue;
         for (i = 0; is_space(line->data[i]); i++);   /* skip leading space */
         if (line->data[i]) {
-            if (new_cmd && is_space(line->data[0]) && last_cmd_line > 0)
+            if (new_cmd && is_space(line->data[0]) && last_cmd_line > 0) {
                 tfprintf(tferr,
                     "%% %s: line %d: Warning: possibly missing trailing \\%A",
                     loadfile->name, last_cmd_line, warning_attr);
+		if (!file_load_context_current(sock, generation)) {
+		    Stringtrunc(cmd, 0);
+		    error = 1;
+		    break;
+		}
+	    }
             last_cmd_line = loadline;
             SStringocat(cmd, CS(line), i);
             if (line->data[line->len - 1] == '\\') {
@@ -589,9 +618,15 @@ int do_file_load(const char *args, int tinytalk, char **savename)
             } else {
                 i = line->len - 1;
                 while (i > 0 && is_space(line->data[i])) i--;
-                if (line->data[i] == '\\')
+                if (line->data[i] == '\\') {
                     tf_wprintf("whitespace following final '\\'");
-            }
+		    if (!file_load_context_current(sock, generation)) {
+			Stringtrunc(cmd, 0);
+			error = 1;
+			break;
+		    }
+		}
+	    }
         } else {
             last_cmd_line = 0;
         }
@@ -617,7 +652,11 @@ int do_file_load(const char *args, int tinytalk, char **savename)
             error = 1;
             break;
         }
-        Stringtrunc(cmd, 0);
+	Stringtrunc(cmd, 0);
+	if (!file_load_context_current(sock, generation)) {
+	    error = 1;
+	    break;
+	}
     }
 
     if (cmd->len) {
@@ -630,6 +669,8 @@ int do_file_load(const char *args, int tinytalk, char **savename)
     Stringfree(cmd);
     if (tfclose(loadfile) != 0)
         eputs("load: unknown error reading file");
+    if (!file_load_context_current(sock, generation))
+	error = 1;
     loadfile = old_file;
     loadline = old_loadline;
     loadstart = old_loadstart;
@@ -638,6 +679,25 @@ int do_file_load(const char *args, int tinytalk, char **savename)
         exiting = 0;
 
     return !error;
+}
+
+int do_file_load(const char *args, int tinytalk, char **savename)
+{
+    return do_file_load_internal(args, tinytalk, savename, NULL, 0);
+}
+
+int do_file_load_for_socket(const char *args, int tinytalk, char **savename,
+    struct Sock *sock, unsigned long generation)
+{
+    ProgContext load_context, *saved_prog_context;
+    int result;
+
+    saved_prog_context = push_dependent_socket_prog_context(
+	&load_context, sock, generation);
+    result = do_file_load_internal(
+	args, tinytalk, savename, sock, generation);
+    restore_prog_context(saved_prog_context);
+    return result;
 }
 
 

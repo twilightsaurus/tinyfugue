@@ -23,6 +23,7 @@
 #include "output.h"	/* iput(), idel(), redraw()... */
 #include "history.h"	/* history_sub() */
 #include "expand.h"	/* macro_run() */
+#include "socket.h"
 #include "cmdlist.h"
 #include "variable.h"	/* unsetvar() */
 
@@ -201,7 +202,14 @@ int handle_keyboard_input(int read_flag)
         } else if (!keynode->children) {
             /* Total match; process everything up to here and call the macro. */
 	    int kbnumlocal = 0;
-            Macro *macro = (Macro *)keynode->u.datum;
+	    Macro *macro = (Macro *)keynode->u.datum;
+	    ProgContext key_context, *saved_prog_context;
+	    struct Sock *key_sock;
+	    unsigned long key_generation = socket_generation(xsock);
+	    key_sock = xsock &&
+		socket_incarnation_live(xsock, key_generation) ? xsock : NULL;
+	    saved_prog_context = push_socket_prog_context(
+		&key_context, key_sock, key_sock ? key_generation : 0);
             handle_input_string(s + input_start, key_start - input_start);
             key_start = input_start = place;
             keynode = NULL;  /* before do_macro(), for reentrance */
@@ -210,6 +218,7 @@ int handle_keyboard_input(int read_flag)
 		reset_kbnum();
 	    }
             do_macro(macro, NULL, 0, USED_KEY, kbnumlocal);
+	    restore_prog_context(saved_prog_context);
 	    kbnum_internal = 0;
         } /* else, partial match; just hold on to it for now. */
     }
@@ -425,7 +434,9 @@ int handle_input_line(void)
 {
     String *line;
     int result;
-
+    ProgContext input_context, *saved_prog_context;
+    struct Sock *input_sock;
+    unsigned long input_generation;
     SStringcpy(scratch, CS(keybuf));
     Stringtrunc(keybuf, keyboard_pos = 0);
     pending_line = FALSE;
@@ -442,12 +453,20 @@ int handle_input_line(void)
     } else
         line = scratch;
 
+    /* Input on a dead foreground starts new work, not stale socket work. */
+    input_generation = socket_generation(xsock);
+    input_sock = xsock &&
+	socket_incarnation_live(xsock, input_generation) ? xsock : NULL;
+    saved_prog_context = push_socket_prog_context(
+	&input_context, input_sock, input_sock ? input_generation : 0);
+
     if (kecho)
 	tfprintf(tferr, "%S%S%A", kprefix, line, getattrvar(VAR_kecho_attr));
     gettime(&line->time);
     record_input(CS(line));
     readsafe = 1;
     result = macro_run(CS(line), 0, NULL, 0, sub, "\bUSER");
+    restore_prog_context(saved_prog_context);
     readsafe = 0;
     return result;
 }
