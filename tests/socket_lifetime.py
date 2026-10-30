@@ -328,6 +328,7 @@ def run_tf(binary, script, files=None, keep_stdin_open=False, stdin_data=None,
         )
         env = os.environ.copy()
         env["LC_ALL"] = "C.UTF-8"
+        env["TERM"] = "xterm"
         lsan_options = env.get("LSAN_OPTIONS", "")
         env["LSAN_OPTIONS"] = (
             lsan_options + (":" if lsan_options else "") +
@@ -338,7 +339,6 @@ def run_tf(binary, script, files=None, keep_stdin_open=False, stdin_data=None,
                 str(binary), f"-L{libdir}", f"-f{config}", "-n", "-v"
             ]
             if visual_terminal or interactive_terminal:
-                env["TERM"] = "xterm"
                 master, slave = pty.openpty()
                 chunks = []
 
