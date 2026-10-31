@@ -1362,7 +1362,7 @@ def more_hook_output_preserves_pending_line(binary):
 /quit -y
 ''')
     assert_line(proc.stdout, "PAGER_PENDING")
-    assert_contains(proc.stdout, "PAGER_BACK=2")
+    assert_line(proc.stdout, "PAGER_BACK=2")
 
 
 def nested_charset_replacement(binary):
@@ -1457,15 +1457,6 @@ def explicit_fake_recv_target(binary):
 
 
 def repeated_address_failure(binary):
-    infos = socket.getaddrinfo(
-        "localhost.localdomain", 1, type=socket.SOCK_STREAM
-    )
-    ordered_families = [info[0] for info in infos]
-    if ordered_families[0] != socket.AF_INET6 or \
-            socket.AF_INET not in ordered_families[1:]:
-        raise AssertionError(
-            "localhost.localdomain does not order failing IPv6 before IPv4"
-        )
     with ScriptedServer([b""]) as server:
         proc = run_tf(binary, f'''/set connect=blocking
 /test addworld("multi", "", "localhost.localdomain", "{server.port}")
@@ -1486,15 +1477,6 @@ def repeated_address_failure(binary):
 
 
 def tls_multi_address_fallback(binary):
-    infos = socket.getaddrinfo(
-        "localhost.localdomain", 1, type=socket.SOCK_STREAM
-    )
-    ordered_families = [info[0] for info in infos]
-    if ordered_families[0] != socket.AF_INET6 or \
-            socket.AF_INET not in ordered_families[1:]:
-        raise AssertionError(
-            "localhost.localdomain does not order IPv6 before IPv4"
-        )
 
     ipv6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     ipv4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1750,15 +1732,6 @@ def async_connect_hook_reconnect(binary):
 
 
 def async_multi_address_fallback(binary):
-    infos = socket.getaddrinfo(
-        "localhost.localdomain", 1, type=socket.SOCK_STREAM
-    )
-    ordered_families = [info[0] for info in infos]
-    if ordered_families[0] != socket.AF_INET6 or \
-            socket.AF_INET not in ordered_families[1:]:
-        raise AssertionError(
-            "localhost.localdomain does not order failing IPv6 before IPv4"
-        )
     with ScriptedServer([b""]) as server:
         proc = run_tf(binary, f'''/set connect=nonblocking
 /test addworld("multi", "", "localhost.localdomain", "{server.port}")
@@ -3932,6 +3905,19 @@ def main():
         parser.error(f"binary not found: {binary}")
 
     features = probe_features(binary)
+    try:
+        address_families = [
+            info[0] for info in socket.getaddrinfo(
+                "localhost.localdomain", 1, type=socket.SOCK_STREAM
+            )
+        ]
+    except socket.gaierror:
+        address_families = []
+    multi_address_fallback = (
+        bool(address_families)
+        and address_families[0] == socket.AF_INET6
+        and socket.AF_INET in address_families[1:]
+    )
     cases = [
         ("mfile selects B during A initialization",
          initialization_mfile_select),
@@ -3965,7 +3951,6 @@ def main():
         ("nested send buffers", nested_sends),
         ("SOCKECHO retirement", sockecho_retirement),
         ("explicit fake_recv target", explicit_fake_recv_target),
-        ("repeated multi-address failure", repeated_address_failure),
         ("ordinary output hook reincarnation", output_reentrancy_ordinary),
         ("output foreground change remains valid",
          output_reentrancy_foreground_change),
@@ -3975,7 +3960,6 @@ def main():
         ("async pending completion", async_pending_completion),
         ("async pending reconnect", async_pending_reconnect),
         ("async H_CONNECT reconnect", async_connect_hook_reconnect),
-        ("async multi-address fallback", async_multi_address_fallback),
         ("async pending foreground change",
          async_pending_foreground_change),
         ("fg_sock(NULL) rejects hook connect", foreground_null_hook_connect),
@@ -4067,6 +4051,14 @@ def main():
          world_output_owner_cancellation),
         ("disconnect owner cancellation", disconnect_owner_cancellation),
     ]
+    if multi_address_fallback:
+        cases.extend([
+            ("repeated multi-address failure", repeated_address_failure),
+            ("async multi-address fallback", async_multi_address_fallback),
+        ])
+    else:
+        print("SKIP: multi-address fallback cases "
+              "(localhost.localdomain does not resolve as IPv6 then IPv4)")
     if args.without_widechar:
         print("SKIP: synthetic reincarnation cleanup (widechar disabled)")
         print("SKIP: Telnet charset replacement (widechar disabled)")
@@ -4108,9 +4100,12 @@ def main():
         cases.extend([
             ("TLS failure same-world reconnect", tls_failure_reconnect),
             ("TLS failure callback send", tls_failure_callback_send),
-            ("TLS multi-address fallback", tls_multi_address_fallback),
             ("TLS write failure", tls_write_failure),
         ])
+        if multi_address_fallback:
+            cases.append(
+                ("TLS multi-address fallback", tls_multi_address_fallback)
+            )
     elif ssl is None:
         print("SKIP: TLS lifetime cases (Python ssl unavailable)")
     else:
