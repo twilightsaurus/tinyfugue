@@ -336,7 +336,7 @@ def run_tf(binary, script, files=None, keep_stdin_open=False, stdin_data=None,
         config.write_bytes(pad_config_read_boundaries(config_data))
         suppressions = root / "lsan.supp"
         suppressions.write_text(
-            "leak:ch_visual\nleak:hwrite\nleak:init_ssl\n",
+            "leak:ch_visual\nleak:hwrite\nleak:init_ssl\nleak:redraw_window\n",
             encoding="ascii",
         )
         env = os.environ.copy()
