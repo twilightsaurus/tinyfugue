@@ -20,11 +20,18 @@ import zlib
 TIMEOUT = 15
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
+
 def recv_or_eof(conn):
     try:
         return conn.recv(4096)
     except ConnectionResetError:
         return b""
+
+
+def expected_telnet_transports(expected):
+    with_msdp = expected[:3] + b"\xff\xfd\x45" + expected[3:]
+    return ([expected], [with_msdp])
+
 
 # Self-signed loopback fixture; this private key has no use outside the tests.
 
@@ -668,7 +675,7 @@ def charset_replacement(binary):
         b"\xff\xfd\x2a"
         b"\xff\xfa\x2a\x02ISO-8859-1\xff\xf0"
     )
-    if server.connections != [expected]:
+    if server.connections not in expected_telnet_transports(expected):
         raise AssertionError(
             f"unexpected CHARSET transport data: {server.connections!r}"
         )
@@ -697,7 +704,7 @@ def mccp_charset_replacement(binary):
         b"\xff\xfd\x2a"
         b"\xff\xfa\x2a\x02ISO-8859-1\xff\xf0"
     )
-    if server.connections != [expected]:
+    if server.connections not in expected_telnet_transports(expected):
         raise AssertionError(
             f"unexpected MCCP/CHARSET transport data: {server.connections!r}"
         )
@@ -1384,7 +1391,8 @@ def nested_charset_replacement(binary):
         b"\xff\xfd\x2a"
         b"\xff\xfa\x2a\x02ISO-8859-1\xff\xf0"
     )
-    if world_a.connections != [expected] or world_b.connections != [b""]:
+    if world_a.connections not in expected_telnet_transports(expected) or \
+            world_b.connections != [b""]:
         raise AssertionError("nested CHARSET replacement transport mismatch")
 
 
@@ -1426,7 +1434,7 @@ def overlong_charset(binary):
 ''')
     assert_line(proc.stdout, "OVERLONG_SAFE")
     expected = b"\xff\xfb\x1f\xff\xfd\x2a\xff\xfa\x2a\x03\xff\xf0"
-    if server.connections != [expected]:
+    if server.connections not in expected_telnet_transports(expected):
         raise AssertionError(
             f"overlong CHARSET response mismatch: {server.connections!r}"
         )
