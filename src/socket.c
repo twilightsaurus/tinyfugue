@@ -1382,6 +1382,7 @@ static int fg_sock(Sock *sock, int quiet)
 		    --active_count;
 		    update_status_field(NULL, STAT_ACTIVE);
 		    result = 0;
+		    restore_foreground = 1;
 		    goto done;
 		}
 	    }
@@ -3280,7 +3281,7 @@ int handle_fake_recv_function(conString *string, const char *world,
     }
     {
 	Sock *old_xsock = xsock;
-
+	unsigned long old_generation = socket_generation(old_xsock);
 	xsock = sock;
 	if (raw)
 	    handle_socket_input(string->data, string->len, NULL);
@@ -3288,7 +3289,9 @@ int handle_fake_recv_function(conString *string, const char *world,
 	    queue_socket_line(sock, string, string->len, 0);
 	    flushxsock();
 	}
-	xsock = old_xsock;
+	if (!old_xsock ||
+	    socket_incarnation_live(old_xsock, old_generation))
+	    xsock = old_xsock;
     }
     return 1;
 }

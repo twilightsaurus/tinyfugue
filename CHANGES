@@ -15,6 +15,8 @@ Fixed reentrant output callbacks so a retired socket incarnation cannot
     lines and indicators, and dead-world screen rollback are preserved.
 Fixed: in non-virtual mode, a retired More callback that switched worlds could
     freeze the replacement world's More indicator.
+Fixed synthetic input and failed foreground switches restoring retired sockets
+    as the default operation target.
 Fixed macro.h include-order dependence on socket declarations.
 
 

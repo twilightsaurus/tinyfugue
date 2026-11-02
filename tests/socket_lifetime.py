@@ -1441,19 +1441,27 @@ def overlong_charset(binary):
 
 
 def explicit_fake_recv_target(binary):
-    proc = run_tf(binary, f'''/set connect=blocking
-/test addworld("A", "", "", "", "", "", "", "e")
-/test addworld("B", "", "", "", "", "", "", "e")
+    with ScriptedServer([b""]) as world_a:
+        with ScriptedServer([b""]) as world_b:
+            proc = run_tf(binary, f'''/set connect=blocking
+/test addworld("A", "", "127.0.0.1", "{world_a.port}")
+/test addworld("B", "", "127.0.0.1", "{world_b.port}")
 /connect -b A
 /connect -b B
 /fg A
-/def -1 -wA -mglob -t"RAW" wrong = /test echo("RAW_AT_A")
-/def -1 -wB -mglob -t"RAW" right = /test echo("RAW_AT_B")%; /quit -y
-/test fake_recv({tf_byte_string(b"RAW\n")}, "B", "r")
+/def -1 -wB -mglob -t"RAW" switch = /dc A%; /fg B
+/test fake_recv("RAW", "B")
+/test send("B_DEFAULT", "", "f")
+/test send("B_EXPLICIT", "B", "f")
+/quit -y
 ''')
-    assert_line(proc.stdout, "RAW_AT_B")
-    if "RAW_AT_A" in proc.stdout:
-        raise AssertionError("explicit fake_recv input was parsed on xsock")
+    if world_a.connections != [b""] or \
+            world_b.connections != [b"B_DEFAULTB_EXPLICIT"]:
+        raise AssertionError(
+            f"explicit fake_recv restored a retired socket: "
+            f"A={world_a.connections!r}, B={world_b.connections!r}\n"
+            f"{proc.stdout}"
+        )
 
 
 def repeated_address_failure(binary):
@@ -3201,7 +3209,7 @@ def foreground_status_active_rollback(binary):
 /set status_int_active=retire_target()
 /set status_retire=1
 /test fg_result := eval("/fg B")
-/test send(strcat("ROLLBACK=", fg_result, ",", fg_world(), ",", active_before, ",", nactive(), ",", is_connected("B")), "A", "f")
+/test send(strcat("ROLLBACK=", fg_result, ",", fg_world(), ",", active_before, ",", nactive(), ",", is_connected("B")), "", "f")
 /quit -y
 ''', visual_terminal=True)
     if world_a.connections != [b"ROLLBACK=0,A,1,1,0"] or \
