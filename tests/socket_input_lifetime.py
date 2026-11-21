@@ -290,6 +290,23 @@ def queued_reincarnation_before_close(binary):
     assert_line(proc.stdout, "SAW_OLD")
     assert_line(proc.stdout, "SAW_NEW")
 
+def queued_zombie_reincarnation_before_close(binary):
+    with ScriptedServer([b""]) as outer, \
+            ScriptedServer([b"", b""]) as target:
+        proc = run_tf(binary, f'''/set connect=blocking
+/test addworld("A", "", "127.0.0.1", "{outer.port}")
+/test addworld("B", "", "127.0.0.1", "{target.port}")
+/def -1 -wA -mglob -t"OUTER" outer = /test fake_recv("OLD", "B")%; /dc B
+/def -1 -wB -mglob -t"OLD" retire = /test echo("SAW_OLD")%; /connect -b B%; /test fake_recv("NEW", "B")%; /dc B%; /repeat -1 1 /quit -y
+/def -1 -wB -mglob -t"NEW" seen = /test echo("SAW_NEW")%; /quit -y
+/connect -b B
+/connect -f A
+/test fake_recv("OUTER", "A")
+''')
+    assert_line(proc.stdout, "SAW_OLD")
+    assert_line(proc.stdout, "SAW_NEW")
+
+
 
 def telnet_callback_disconnect(binary):
     with ScriptedServer([(b"READY", b"\xff\xf1TELNET_CALLBACK_STALE")]) as server:
@@ -417,6 +434,8 @@ def main():
         ("queued prompt before close", queued_prompt_before_close),
         ("queued same-socket reincarnation", queued_reconnect),
         ("queued reincarnation before close", queued_reincarnation_before_close),
+        ("queued zombie reincarnation",
+         queued_zombie_reincarnation_before_close),
         ("TELNET callback retirement", telnet_callback_disconnect),
         ("disconnect during TELNET chunk", telnet_disconnect),
         ("same-socket TELNET reincarnation", telnet_reconnect),

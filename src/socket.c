@@ -3063,7 +3063,7 @@ static void handle_socket_lines(void)
     } while ((line = dequeue(&sock->queue)));
 
 done:
-    if (sock->generation == generation + 1 &&
+    if (!started_zombie && sock->generation == generation + 1 &&
 	sock->constate >= SS_ZOMBIE && sock->queue.list.head)
     {
 	/* Reconnect drains old lines, so these still belong to this parser. */
